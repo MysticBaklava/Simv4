@@ -44,9 +44,7 @@ namespace ModbusSimV1
             InitializeComponent();
 
             // after InitializeComponent();
-            _cmbMachineEvent = cmbEvent;
             cmbEvent.Items.AddRange(_eventMapByValue.Values.ToArray());
-            cmbEvent.SelectedIndexChanged += CmbMachineEvent_SelectedIndexChanged;
 
             // default selection (sync to current Event Tracker if present)
             var evt = GetRegisterByAddress(0x0001);
@@ -555,6 +553,38 @@ namespace ModbusSimV1
             try { if (_modbusClient is { Connected: true }) { _modbusClient.WriteSingleRegister(0x0001, (ushort)value); AppendActivity($"Machine Event → {name} ({value})"); } }
             catch (Exception ex) { AppendActivity($"Machine Event write error: {ex.Message}"); }
             var evtItem = _registerItems.FirstOrDefault(r => r.Address == 0x0001); if (evtItem != null) UpdateRegisterValueDisplay(evtItem, value);
+        }
+
+        private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
+
+        private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
+        {
+            bool enabled = chkAutomationEnabled.Checked;
+            _lastEventTrackerValue = null;
+            AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
+            if (!enabled) SetPollInterval(_defaultPollMs);
+        }
+
+        private void headerPanel_Paint(object? sender, PaintEventArgs e)
+        {
+            using var pen = new Pen(Color.FromArgb(64, Color.Black));
+            e.Graphics.DrawLine(pen, 0, e.ClipRectangle.Bottom - 1, e.ClipRectangle.Right, e.ClipRectangle.Bottom - 1);
+        }
+
+        private void flowRegisters_Paint(object? sender, PaintEventArgs e)
+        {
+            // No custom painting required; method exists to satisfy designer hook.
+        }
+
+        private void label1_Click(object? sender, EventArgs e)
+        {
+            // Intentionally left empty; label is informational only.
+        }
+
+        private void lstActivity_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            // Keep the activity log read-only by clearing the selection.
+            if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
         }
 
         // ===== misc UI =====
