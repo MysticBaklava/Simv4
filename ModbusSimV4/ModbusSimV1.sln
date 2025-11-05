@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36616.10 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ModbusSimV1", "ModbusSimV1.csproj", "{31BE8542-B912-40DB-84D5-EBE7DBE49574}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{31BE8542-B912-40DB-84D5-EBE7DBE49574}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{31BE8542-B912-40DB-84D5-EBE7DBE49574}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{31BE8542-B912-40DB-84D5-EBE7DBE49574}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{31BE8542-B912-40DB-84D5-EBE7DBE49574}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {3B0E2D0A-B1C4-44D0-8307-121736DA739D}
+	EndGlobalSection
+EndGlobal
