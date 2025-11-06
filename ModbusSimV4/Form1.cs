@@ -451,7 +451,16 @@ namespace ModbusSimV1
         }
 
         private void WriteUdint(int addr, uint value) => _modbusClient!.WriteMultipleRegisters(addr, SplitUInt32ToWords(value));
-        private uint ReadUdint(int addr) { var v = _modbusClient!.ReadHoldingRegisters(addr, 2); return CombineToUInt32(v[0], v[1]); }
+        private ushort ReadUInt16(int addr)
+        {
+            var words = _modbusClient!.ReadHoldingRegisters(addr, 1);
+            return words.Length > 0 ? (ushort)words[0] : (ushort)0;
+        }
+        private uint ReadUdint(int addr)
+        {
+            var v = _modbusClient!.ReadHoldingRegisters(addr, 2);
+            return CombineToUInt32(v[0], v[1]);
+        }
         private void SetPollInterval(int ms) => Ui(() => { if (_pollTimer.Interval != ms) _pollTimer.Interval = ms; });
 
         private void WriteMasterRange0to6()
@@ -459,6 +468,7 @@ namespace ModbusSimV1
             if (!EnsureConnected(false)) return; var items = GetItemsInRange(0x0000, 0x0006).Where(i => i.IsWritable).ToList();
             foreach (var item in items)
             {
+                if (item.Address == 0x0002) continue; // poll counter handled separately
                 if (!_registerDisplays.TryGetValue(item.Address, out var disp)) continue;
                 try
                 {
@@ -466,8 +476,7 @@ namespace ModbusSimV1
                     { string text = UiGet(() => disp.ValueBox.Text); if (!ulong.TryParse(text, out var ul) || ul > uint.MaxValue) continue; uint u32 = (uint)ul; WriteUdint(item.Address, u32); Ui(() => UpdateRegisterValueDisplay(item, u32.ToString())); }
                     else
                     {
-                        ushort value; if (item.Address == 0x0002) { string cur = UiGet(() => disp.ValueBox.Text); if (!ushort.TryParse(cur, out value)) value = 0; value = (ushort)((value + 1) & 0xFFFF); }
-                        else { string text = UiGet(() => disp.ValueBox.Text); if (!ushort.TryParse(text, out value)) continue; }
+                        string text = UiGet(() => disp.ValueBox.Text); if (!ushort.TryParse(text, out ushort value)) continue;
                         _modbusClient!.WriteSingleRegister(item.Address, value); Ui(() => UpdateRegisterValueDisplay(item, value));
                     }
                 }
@@ -475,9 +484,27 @@ namespace ModbusSimV1
             }
         }
 
+        private void IncrementPollCounter()
+        {
+            try
+            {
+                ushort current = ReadUInt16(0x0002);
+                ushort next = (ushort)((current + 1) & 0xFFFF);
+                _modbusClient!.WriteSingleRegister(0x0002, next);
+                var pollItem = GetRegisterByAddress(0x0002);
+                if (pollItem != null) Ui(() => UpdateRegisterValueDisplay(pollItem, next));
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Poll counter update failed: {ex.Message}");
+            }
+        }
+
         private void CyclicStep()
         {
             if (!EnsureConnected(false)) { Ui(() => StopCyclicPolling()); return; }
+
+            IncrementPollCounter();
 
             if (!UiGet(() => chkAutomationEnabled.Checked))
             {
