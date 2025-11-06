@@ -387,6 +387,16 @@ namespace ModbusSimV1
             catch (Exception ex) { AppendActivity($"Read error ({item.Name}): {ex.Message}"); if (showErrors) MessageBox.Show($"Read failed: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         }
 
+        private RegisterItem? GetRegisterByAddress(int address)
+        {
+            if (_registerDisplays.TryGetValue(address, out var display))
+            {
+                return display.Item;
+            }
+
+            return _registerItems.FirstOrDefault(r => r.Address == address);
+        }
+
         private void UpdateRegisterValueDisplay(RegisterItem item, int value)
         {
             item.LastValue = value;
