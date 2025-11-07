@@ -57,6 +57,8 @@ namespace ModbusSimV1
             this.cmbEvent = new System.Windows.Forms.ComboBox();
             this.lblActivity = new System.Windows.Forms.Label();
             this.lstActivity = new System.Windows.Forms.ListBox();
+            this.lblRxTx = new System.Windows.Forms.Label();
+            this.lstRxTx = new System.Windows.Forms.ListBox();
             this.layoutRoot.SuspendLayout();
             this.leftLayout.SuspendLayout();
             this.headerPanel.SuspendLayout();
