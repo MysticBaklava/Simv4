@@ -13,13 +13,23 @@ namespace ModbusSimV1
 {
     public partial class Form1 : Form
     {
+        // Backing store for the register cards on the UI – we drive these collections from
+        // the automation routines and the incoming Modbus traffic, so keep them readily accessible.
         private readonly BindingList<RegisterItem> _registerItems = new();
         private readonly Dictionary<int, RegisterDisplay> _registerDisplays = new();
+
+        // Single timer that powers both manual cyclic polling and automation-driven flows.
         private readonly System.Windows.Forms.Timer _pollTimer;
+
+        // Active Modbus client and connection bookkeeping state.
         private ModbusClient? _modbusClient;
         private string? _connectedPortName;
+
+        // Selection + polling state shared across various helpers.
         private RegisterItem? _selectedRegister;
         private bool _isPolling;
+
+        // Helpers for word/byte conversions and bounded RX/TX log storage.
         private const bool SWAP_WORDS = true;
         private const int RxTxLogCapacity = 500;
         private static readonly PropertyInfo? SendDataProperty = typeof(ModbusClient).GetProperty("SendData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
@@ -29,6 +39,8 @@ namespace ModbusSimV1
         private int _rxTxSequence;
 
         // ===== Event dropdown on the right panel =====
+        // Primary translation map for the Event Tracker register.  This drives both the
+        // combo box labels and the automation state machine below.
         private readonly Dictionary<int, string> _eventMapByValue = new()
         {
             {10, "Idle"},
@@ -43,8 +55,14 @@ namespace ModbusSimV1
         private Dictionary<string, int>? _eventMapByName;
         private bool _suppressEventCombo = false;
         private int? _lastEventTrackerValue = null;
+
+        // Default poll cadence for the background timer.  Individual states stretch/shorten it.
         private readonly int _defaultPollMs = 1500;
+
+        // Single RNG instance that feeds the automation's pseudo-random payment/program picks.
         private readonly Random _rng = new Random();
+
+        // Timestamp bookkeeping for automation throttling and state transitions.
         private DateTime _lastIdlePaymentPoll = DateTime.MinValue;
         private DateTime _lastSelectionPaymentPoll = DateTime.MinValue;
         private bool _idlePaymentHandshakeRaised;
@@ -504,6 +522,8 @@ namespace ModbusSimV1
             }
         }
 
+        // Ensure the master-writable run registers (total/program/time) are reset to zero.
+        // We invoke this whenever an automation state requires a clean slate before continuing.
         private void ResetRunRegistersToZero()
         {
             try
@@ -556,6 +576,46 @@ namespace ModbusSimV1
             }
         }
 
+        // The slave keeps bit0 of 0x000B high to announce a pending program-price update.
+        // When that flag stays high while the controller reports "finished" (bit0 of 0x0000),
+        // the handshake is stuck.  Clear the finished bit so the payment system can re-trigger
+        // and the UI reflects the new request.
+        private bool ClearPriceUpdateFinishedWhenAvailable(ushort paymentStatus, ref bool performedPoll)
+        {
+            if ((paymentStatus & 0x0001) == 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                ushort controllerStatus = ReadUInt16(0x0000);
+                performedPoll = true;
+                var controllerItem = GetRegisterByAddress(0x0000);
+                if (controllerItem != null) Ui(() => UpdateRegisterValueDisplay(controllerItem, controllerStatus));
+
+                if ((controllerStatus & 0x0001) != 0)
+                {
+                    ushort cleared = (ushort)(controllerStatus & ~0x0001);
+                    if (cleared != controllerStatus)
+                    {
+                        _modbusClient!.WriteSingleRegister(0x0000, cleared);
+                        if (controllerItem != null) Ui(() => UpdateRegisterValueDisplay(controllerItem, cleared));
+                        AppendActivity("Program price update finished bit cleared while availability flag remained set.");
+                    }
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to clear Program Price Update Finished bit: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        // Convenience helper to raise/lower controller status bit0 while keeping the UI in sync
+        // and avoiding redundant writes if the bit is already in the desired state.
         private void SetControllerStatusBit0(bool on, ref bool performedPoll)
         {
             ushort current;
@@ -593,6 +653,8 @@ namespace ModbusSimV1
             }
         }
 
+        // Bump Poll Counter (0x0002) and mirror the value in the register card.  Only invoked
+        // after an actual Modbus read/write to stay faithful to the hardware behavior.
         private void IncrementPollCounter()
         {
             try
@@ -615,18 +677,24 @@ namespace ModbusSimV1
 
             bool performedPoll = false;
 
+            // Automation disabled → behave like the legacy tool: keep master registers clean and
+            // mirror the payment system/price table as the slave exposes them.
             if (!UiGet(() => chkAutomationEnabled.Checked))
             {
                 WriteMasterRange0to6();
                 var mapA = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E), ref performedPoll);
                 bool priceUpdate = mapA.TryGetValue(0x000B, out int st) && ((st & 0x0001) != 0);
+                if (mapA.TryGetValue(0x000B, out int paymentStatusValue))
+                {
+                    ClearPriceUpdateFinishedWhenAvailable((ushort)(paymentStatusValue & 0xFFFF), ref performedPoll);
+                }
                 if (priceUpdate) BulkReadRangeUpdate(GetItemsInRange(0x0014, 0x0041), ref performedPoll);
                 SetPollInterval(_defaultPollMs);
                 if (performedPoll) IncrementPollCounter();
                 return;
             }
 
-            // Automation ON — drive by Event Tracker
+            // Automation ON — the Event Tracker register becomes the state machine selector.
             int curEvent;
             try { var arr = _modbusClient!.ReadHoldingRegisters(0x0001, 1); performedPoll = true; curEvent = arr[0] & 0xFFFF; var evtItem = GetRegisterByAddress(0x0001); if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, curEvent)); }
             catch { return; }
@@ -637,6 +705,8 @@ namespace ModbusSimV1
             {
                 case 10: // Idle
                 {
+                    // Idle keeps the operator-facing registers zeroed while issuing a one-minute
+                    // heartbeat poll to see whether the payment system is waving the update flag.
                     SetPollInterval(_defaultPollMs);
                     ResetRunRegistersToZero();
                     if (eventChanged)
@@ -651,19 +721,29 @@ namespace ModbusSimV1
                     {
                         try
                         {
+                            // Bring in the payment status each minute and reflect it in the UI.
                             ushort status = ReadUInt16(0x000B);
                             performedPoll = true;
                             _lastIdlePaymentPoll = now;
                             var statusItem = GetRegisterByAddress(0x000B);
                             if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, status));
 
+                            // Enforce the price-update handshake so we never leave both bits high.
+                            bool clearedFinished = ClearPriceUpdateFinishedWhenAvailable(status, ref performedPoll);
+                            if (clearedFinished)
+                            {
+                                _idlePaymentHandshakeRaised = false;
+                            }
+
                             bool paymentBit0 = (status & 0x0001) != 0;
                             if (paymentBit0)
                             {
+                                // Payment system is requesting attention → read the entire block 0x000B–0x0041.
                                 BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x0041), ref performedPoll);
 
                                 if (!_idlePaymentHandshakeRaised)
                                 {
+                                    // First edge: raise controller bit0 so the slave sees the acknowledgment.
                                     SetControllerStatusBit0(true, ref performedPoll);
                                     _idlePaymentHandshakeRaised = true;
                                 }
@@ -671,6 +751,8 @@ namespace ModbusSimV1
                                 {
                                     try
                                     {
+                                        // Both sides are high – drop our bit so the slave can de-assert and
+                                        // start the handshake again when new prices arrive.
                                         ushort controllerStatus = ReadUInt16(0x0000);
                                         performedPoll = true;
                                         var controllerItem = GetRegisterByAddress(0x0000);
@@ -690,6 +772,7 @@ namespace ModbusSimV1
                             }
                             else if (_idlePaymentHandshakeRaised)
                             {
+                                // Slave dropped the flag – mirror by lowering our own acknowledgment.
                                 SetControllerStatusBit0(false, ref performedPoll);
                                 _idlePaymentHandshakeRaised = false;
                             }
@@ -704,6 +787,7 @@ namespace ModbusSimV1
                 case 20: // Program Selection
                 case 21: // Extra Selection
                 {
+                    // These screens stay at zero while echoing the payment-system status every minute.
                     SetPollInterval(_defaultPollMs);
                     ResetRunRegistersToZero();
                     if (eventChanged)
@@ -722,6 +806,7 @@ namespace ModbusSimV1
                             _lastSelectionPaymentPoll = now;
                             var statusItem = GetRegisterByAddress(0x000B);
                             if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, status));
+                            ClearPriceUpdateFinishedWhenAvailable(status, ref performedPoll);
                         }
                         catch (Exception ex)
                         {
@@ -732,6 +817,8 @@ namespace ModbusSimV1
                 }
                 case 30: // Payment
                 {
+                    // Payment generates pseudo-random totals/program/time once per entry and then
+                    // monitors the slave's payment/discount registers to determine when to advance.
                     SetPollInterval(_defaultPollMs);
                     if (eventChanged)
                     {
@@ -762,10 +849,12 @@ namespace ModbusSimV1
 
                     try
                     {
+                        // Pull the live payment-system status/amounts so the UI matches the slave.
                         ushort paymentStatus = ReadUInt16(0x000B);
                         performedPoll = true;
                         var statusItem = GetRegisterByAddress(0x000B);
                         if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, paymentStatus));
+                        ClearPriceUpdateFinishedWhenAvailable(paymentStatus, ref performedPoll);
 
                         uint paidAmount = ReadUdint(0x000C);
                         performedPoll = true;
@@ -782,6 +871,7 @@ namespace ModbusSimV1
                         var totalItem = GetRegisterByAddress(0x0003);
                         if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, totalToPay.ToString()));
 
+                        // Discount flags mean paid + discount must cover the randomized total.
                         bool paymentReady = paidAmount >= totalToPay;
                         bool requireDiscountCheck = (paymentStatus & 0x0002) != 0 || (paymentStatus & 0x0004) != 0;
                         if (requireDiscountCheck)
@@ -791,6 +881,7 @@ namespace ModbusSimV1
 
                         if (paymentReady)
                         {
+                            // Hand-off to Starting once the simulated payment is complete.
                             try
                             {
                                 _modbusClient!.WriteSingleRegister(0x0001, 40);
@@ -812,6 +903,7 @@ namespace ModbusSimV1
                 }
                 case 40: // Starting
                 {
+                    // After five seconds we clear the price and transition into the active cycle.
                     SetPollInterval(_defaultPollMs);
                     if (eventChanged)
                     {
@@ -841,6 +933,7 @@ namespace ModbusSimV1
                 }
                 case 50: // Cycling
                 {
+                    // Decrement Remaining Time every five seconds until we reach zero → Cycle Finished.
                     SetPollInterval(_defaultPollMs);
                     if (eventChanged)
                     {
@@ -882,6 +975,7 @@ namespace ModbusSimV1
                 }
                 case 60: // Cycle Finished
                 {
+                    // Ten-second dwell before snapping back to Idle and resetting master registers.
                     SetPollInterval(_defaultPollMs);
                     if (eventChanged)
                     {
