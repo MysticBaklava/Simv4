@@ -645,16 +645,32 @@ namespace ModbusSimV1
                             bool paymentBit0 = (status & 0x0001) != 0;
                             if (paymentBit0)
                             {
+                                BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x0041), ref performedPoll);
+
                                 if (!_idlePaymentHandshakeRaised)
                                 {
-                                    BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x0041), ref performedPoll);
                                     SetControllerStatusBit0(true, ref performedPoll);
                                     _idlePaymentHandshakeRaised = true;
                                 }
                                 else
                                 {
-                                    SetControllerStatusBit0(false, ref performedPoll);
-                                    _idlePaymentHandshakeRaised = false;
+                                    try
+                                    {
+                                        ushort controllerStatus = ReadUInt16(0x0000);
+                                        performedPoll = true;
+                                        var controllerItem = GetRegisterByAddress(0x0000);
+                                        if (controllerItem != null) Ui(() => UpdateRegisterValueDisplay(controllerItem, controllerStatus));
+
+                                        if ((controllerStatus & 0x0001) != 0)
+                                        {
+                                            SetControllerStatusBit0(false, ref performedPoll);
+                                        }
+                                        _idlePaymentHandshakeRaised = false;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        AppendActivity($"Idle controller status read failed: {ex.Message}");
+                                    }
                                 }
                             }
                             else if (_idlePaymentHandshakeRaised)
@@ -752,7 +768,7 @@ namespace ModbusSimV1
                         if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, totalToPay.ToString()));
 
                         bool paymentReady = paidAmount >= totalToPay;
-                        bool requireDiscountCheck = (paymentStatus & 0x0004) != 0;
+                        bool requireDiscountCheck = (paymentStatus & 0x0002) != 0 || (paymentStatus & 0x0004) != 0;
                         if (requireDiscountCheck)
                         {
                             paymentReady = paidAmount + discountAmount >= totalToPay;
@@ -895,6 +911,38 @@ namespace ModbusSimV1
             try { if (_modbusClient is { Connected: true }) { _modbusClient.WriteSingleRegister(0x0001, (ushort)value); AppendActivity($"Machine Event → {name} ({value})"); } }
             catch (Exception ex) { AppendActivity($"Machine Event write error: {ex.Message}"); }
             var evtItem = _registerItems.FirstOrDefault(r => r.Address == 0x0001); if (evtItem != null) UpdateRegisterValueDisplay(evtItem, value);
+        }
+
+        private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
+
+        private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
+        {
+            bool enabled = chkAutomationEnabled.Checked;
+            _lastEventTrackerValue = null;
+            AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
+            if (!enabled) SetPollInterval(_defaultPollMs);
+        }
+
+        private void headerPanel_Paint(object? sender, PaintEventArgs e)
+        {
+            using var pen = new Pen(Color.FromArgb(64, Color.Black));
+            e.Graphics.DrawLine(pen, 0, e.ClipRectangle.Bottom - 1, e.ClipRectangle.Right, e.ClipRectangle.Bottom - 1);
+        }
+
+        private void flowRegisters_Paint(object? sender, PaintEventArgs e)
+        {
+            // No custom painting required; method exists to satisfy designer hook.
+        }
+
+        private void label1_Click(object? sender, EventArgs e)
+        {
+            // Intentionally left empty; label is informational only.
+        }
+
+        private void lstActivity_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            // Keep the activity log read-only by clearing the selection.
+            if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
         }
 
         private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
