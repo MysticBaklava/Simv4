@@ -434,11 +434,11 @@ namespace ModbusSimV1
 
         private List<RegisterItem> GetItemsInRange(int startAddr, int endAddr) => _registerItems.Where(it => it.Address >= startAddr && it.Address <= endAddr).OrderBy(it => it.Address).ToList();
 
-        private Dictionary<int, int> BulkReadRangeUpdate(List<RegisterItem> items)
+        private Dictionary<int, int> BulkReadRangeUpdate(List<RegisterItem> items, ref bool polled)
         {
             var result = new Dictionary<int, int>(); if (items.Count == 0 || !EnsureConnected(false)) return result;
             int start = items.Min(it => it.Address); int maxEnd = items.Max(it => it.Address + it.WordLength); int totalWords = maxEnd - start; if (totalWords <= 0) return result;
-            int[] all; try { all = _modbusClient!.ReadHoldingRegisters(start, totalWords); } catch { Ui(() => StopCyclicPolling()); return result; }
+            int[] all; try { all = _modbusClient!.ReadHoldingRegisters(start, totalWords); polled = true; } catch { Ui(() => StopCyclicPolling()); return result; }
             foreach (var item in items)
             {
                 int offset = item.Address - start; if (offset < 0 || offset >= all.Length) continue;
@@ -504,29 +504,30 @@ namespace ModbusSimV1
         {
             if (!EnsureConnected(false)) { Ui(() => StopCyclicPolling()); return; }
 
-            IncrementPollCounter();
+            bool performedPoll = false;
 
             if (!UiGet(() => chkAutomationEnabled.Checked))
             {
                 WriteMasterRange0to6();
-                var mapA = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E));
+                var mapA = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E), ref performedPoll);
                 bool priceUpdate = mapA.TryGetValue(0x000B, out int st) && ((st & 0x0001) != 0);
-                if (priceUpdate) BulkReadRangeUpdate(GetItemsInRange(0x0014, 0x0041));
+                if (priceUpdate) BulkReadRangeUpdate(GetItemsInRange(0x0014, 0x0041), ref performedPoll);
                 SetPollInterval(_defaultPollMs);
+                if (performedPoll) IncrementPollCounter();
                 return;
             }
 
             // Automation ON — drive by Event Tracker
             int curEvent;
-            try { var arr = _modbusClient!.ReadHoldingRegisters(0x0001, 1); curEvent = arr[0] & 0xFFFF; var evtItem = GetRegisterByAddress(0x0001); if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, curEvent)); }
+            try { var arr = _modbusClient!.ReadHoldingRegisters(0x0001, 1); performedPoll = true; curEvent = arr[0] & 0xFFFF; var evtItem = GetRegisterByAddress(0x0001); if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, curEvent)); }
             catch { return; }
 
             bool eventChanged = _lastEventTrackerValue != curEvent; _lastEventTrackerValue = curEvent;
 
             switch (curEvent)
             {
-                case 10: // Idle — poll every minute, read 11..14
-                    SetPollInterval(_idlePollMs); BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E)); break;
+                case 10: // Idle — poll every minute, read payment system status
+                    SetPollInterval(_idlePollMs); BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000B), ref performedPoll); break;
                 case 20: // Program Selection — zero 3..6 once
                     SetPollInterval(_defaultPollMs);
                     if (eventChanged)
@@ -563,11 +564,12 @@ namespace ModbusSimV1
                         }
                         catch (Exception ex) { AppendActivity($"Payment randomization error: {ex.Message}"); }
                     }
-                    var mapPay = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E));
+                    var mapPay = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E), ref performedPoll);
                     try
                     {
                         bool statusZero = mapPay.TryGetValue(0x000B, out int st2) && st2 == 0;
-                        uint paid = ReadUdint(0x000C); uint total = ReadUdint(0x0003);
+                        uint paid = ReadUdint(0x000C); performedPoll = true;
+                        uint total = ReadUdint(0x0003); performedPoll = true;
                         if (statusZero && paid >= total)
                         {
                             _modbusClient!.WriteSingleRegister(0x0001, 40); // Starting
@@ -578,8 +580,10 @@ namespace ModbusSimV1
                     catch (Exception ex) { AppendActivity($"Payment check error: {ex.Message}"); }
                     break;
                 default: // Starting/Cycling/Cycle Finished/Machine Unavailable — light read
-                    SetPollInterval(_defaultPollMs); BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E)); break;
+                    SetPollInterval(_defaultPollMs); BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E), ref performedPoll); break;
             }
+
+            if (performedPoll) IncrementPollCounter();
         }
 
         // ===== Event combobox handler =====
