@@ -20,6 +20,7 @@ namespace ModbusSimV1
 
         // Single timer that powers both manual cyclic polling and automation-driven flows.
         private readonly System.Windows.Forms.Timer _pollTimer;
+        private const int PollTimerIntervalMs = 1000;
 
         // Active Modbus client and connection bookkeeping state.
         private ModbusClient? _modbusClient;
@@ -28,6 +29,9 @@ namespace ModbusSimV1
         // Selection + polling state shared across various helpers.
         private RegisterItem? _selectedRegister;
         private bool _isPolling;
+        private readonly object _stateLock = new();
+        private readonly Dictionary<int, DateTime> _lastPollByEvent = new();
+        private int? _automationLastProcessedEvent;
 
         // Helpers for word/byte conversions and bounded RX/TX log storage.
         private const bool SWAP_WORDS = true;
@@ -57,17 +61,14 @@ namespace ModbusSimV1
         private int? _lastEventTrackerValue = null;
 
         // Default poll cadence for the background timer.  Individual states stretch/shorten it.
-        private readonly int _defaultPollMs = 1500;
-
         // Single RNG instance that feeds the automation's pseudo-random payment/program picks.
         private readonly Random _rng = new Random();
 
         // Timestamp bookkeeping for automation throttling and state transitions.
-        private DateTime _lastIdlePaymentPoll = DateTime.MinValue;
-        private DateTime _lastSelectionPaymentPoll = DateTime.MinValue;
         private DateTime _startingEnteredAt = DateTime.MinValue;
         private DateTime _cyclingLastTick = DateTime.MinValue;
         private DateTime _cycleFinishedEnteredAt = DateTime.MinValue;
+        private DateTime _lastManualPoll = DateTime.MinValue;
 
         public Form1()
         {
@@ -106,10 +107,12 @@ namespace ModbusSimV1
             cmbEvent.SelectedItem = "Idle";
             cmbEvent.SelectedIndexChanged += CmbEvent_SelectedIndexChanged;
 
-            _pollTimer = new System.Windows.Forms.Timer { Interval = _defaultPollMs };
+            _pollTimer = new System.Windows.Forms.Timer { Interval = PollTimerIntervalMs };
             _pollTimer.Tick += PollTimer_Tick;
 
             flowRegisters.Resize += FlowRegisters_Resize;
+
+            _lastEventTrackerValue = 10;
         }
 
         private void Form1_Load(object? sender, EventArgs e)
@@ -335,6 +338,7 @@ namespace ModbusSimV1
                 _connectedPortName = portName;
                 ResetRxTxLog();
                 AppendActivity($"{portName} Connected");
+                EnsurePollingTimerRunning();
             }
             catch (Exception ex)
             { AppendActivity($"Connection Error: {ex.Message}"); MessageBox.Show($"Could not connect: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); DisconnectInternal(); }
@@ -345,7 +349,7 @@ namespace ModbusSimV1
 
         private void DisconnectInternal()
         {
-            StopCyclicPolling();
+            StopPollingTimer();
             if (_modbusClient is { } existing)
             {
                 DetachClientEvents(existing);
@@ -356,13 +360,22 @@ namespace ModbusSimV1
                 }
             }
             _modbusClient = null; _connectedPortName = null;
+            lock (_stateLock)
+            {
+                _lastPollByEvent.Clear();
+                _automationLastProcessedEvent = null;
+                _startingEnteredAt = DateTime.MinValue;
+                _cyclingLastTick = DateTime.MinValue;
+                _cycleFinishedEnteredAt = DateTime.MinValue;
+                _lastManualPoll = DateTime.MinValue;
+                _lastEventTrackerValue = 10;
+            }
         }
 
         private void UpdateConnectionState()
         {
             bool connected = _modbusClient?.Connected ?? false;
             btnConnect.Enabled = !connected; btnDisconnect.Enabled = connected; btnRefreshPorts.Enabled = !connected; cmbPort.Enabled = !connected;
-            btnCyclicEnable.Enabled = connected; btnCyclicEnable.Text = _pollTimer.Enabled ? "STOP CYCLIC" : "CYCLIC ENABLE";
             btnRead.Enabled = connected && _selectedRegister is not null; btnWrite.Enabled = connected && _selectedRegister?.IsWritable == true;
             lblConnectionStatus.Text = connected ? $"Status: {_connectedPortName ?? "Connected"}" : "Status: Disconnected";
             if (_selectedRegister is RegisterItem sel && _registerDisplays.TryGetValue(sel.Address, out var d))
@@ -443,6 +456,7 @@ namespace ModbusSimV1
                 {
                     Ui(() => { _suppressEventCombo = true; if (!Equals(cmbEvent.SelectedItem, label)) cmbEvent.SelectedItem = label; _suppressEventCombo = false; });
                 }
+                OnEventTrackerValueObserved(value);
             }
             if (_registerDisplays.TryGetValue(item.Address, out var display))
             {
@@ -454,14 +468,26 @@ namespace ModbusSimV1
             item.LastValue = null; if (_registerDisplays.TryGetValue(item.Address, out var display)) if (!string.Equals(display.ValueBox.Text, text, StringComparison.Ordinal)) Ui(() => display.ValueBox.Text = text);
         }
 
-        private void btnCyclicEnable_Click(object? sender, EventArgs e)
-        { if (!EnsureConnected()) return; if (_pollTimer.Enabled) { StopCyclicPolling(true); } else { _pollTimer.Start(); AppendActivity("Cyclic started."); } UpdateConnectionState(); }
-        private void StopCyclicPolling(bool log = false) { if (_pollTimer.Enabled) { _pollTimer.Stop(); if (log) AppendActivity("Cyclic stopped."); } }
-
         private void PollTimer_Tick(object? sender, EventArgs e)
         {
             if (_isPolling) return; _isPolling = true;
             System.Threading.Tasks.Task.Run(() => { try { lock (_pollLock) { CyclicStep(); } } finally { _isPolling = false; } });
+        }
+
+        private void EnsurePollingTimerRunning()
+        {
+            if (!_pollTimer.Enabled)
+            {
+                _pollTimer.Start();
+            }
+        }
+
+        private void StopPollingTimer()
+        {
+            if (_pollTimer.Enabled)
+            {
+                _pollTimer.Stop();
+            }
         }
 
         // ===== CYCLIC / AUTOMATION =====
@@ -475,7 +501,7 @@ namespace ModbusSimV1
         {
             var result = new Dictionary<int, int>(); if (items.Count == 0 || !EnsureConnected(false)) return result;
             int start = items.Min(it => it.Address); int maxEnd = items.Max(it => it.Address + it.WordLength); int totalWords = maxEnd - start; if (totalWords <= 0) return result;
-            int[] all; try { all = _modbusClient!.ReadHoldingRegisters(start, totalWords); polled = true; } catch { Ui(() => StopCyclicPolling()); return result; }
+            int[] all; try { all = _modbusClient!.ReadHoldingRegisters(start, totalWords); polled = true; } catch { Ui(() => StopPollingTimer()); return result; }
             foreach (var item in items)
             {
                 int offset = item.Address - start; if (offset < 0 || offset >= all.Length) continue;
@@ -498,8 +524,6 @@ namespace ModbusSimV1
             var v = _modbusClient!.ReadHoldingRegisters(addr, 2);
             return CombineToUInt32(v[0], v[1]);
         }
-        private void SetPollInterval(int ms) => Ui(() => { if (_pollTimer.Interval != ms) _pollTimer.Interval = ms; });
-
         private void WriteMasterRange0to6()
         {
             if (!EnsureConnected(false)) return; var items = GetItemsInRange(0x0000, 0x0006).Where(i => i.IsWritable).ToList();
@@ -664,292 +688,456 @@ namespace ModbusSimV1
 
         private void CyclicStep()
         {
-            if (!EnsureConnected(false)) { Ui(() => StopCyclicPolling()); return; }
+            if (!EnsureConnected(false)) { Ui(() => StopPollingTimer()); return; }
 
-            bool performedPoll = false;
-
-            // Automation disabled → behave like the legacy tool: keep master registers clean and
-            // mirror the payment system/price table as the slave exposes them.
-            if (!UiGet(() => chkAutomationEnabled.Checked))
+            bool automationEnabled = UiGet(() => chkAutomationEnabled.Checked);
+            if (!automationEnabled)
             {
-                WriteMasterRange0to6();
-                var mapA = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E), ref performedPoll);
-                if (mapA.TryGetValue(0x000B, out int paymentStatusValue))
-                {
-                    SynchronizeProgramPriceUpdate((ushort)(paymentStatusValue & 0xFFFF), pollFullRange: true, ref performedPoll);
-                }
-                SetPollInterval(_defaultPollMs);
-                if (performedPoll) IncrementPollCounter();
+                HandleManualPolling();
                 return;
             }
 
-            // Automation ON — the Event Tracker register becomes the state machine selector.
             int curEvent;
-            try { var arr = _modbusClient!.ReadHoldingRegisters(0x0001, 1); performedPoll = true; curEvent = arr[0] & 0xFFFF; var evtItem = GetRegisterByAddress(0x0001); if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, curEvent)); }
-            catch { return; }
+            int? lastProcessed;
+            DateTime lastPoll;
+            DateTime startingEnteredAt;
+            DateTime cycleFinishedEnteredAt;
 
-            bool eventChanged = _lastEventTrackerValue != curEvent; _lastEventTrackerValue = curEvent;
+            lock (_stateLock)
+            {
+                curEvent = _lastEventTrackerValue ?? 10;
+                lastProcessed = _automationLastProcessedEvent;
+                if (!_lastPollByEvent.TryGetValue(curEvent, out lastPoll))
+                {
+                    lastPoll = DateTime.MinValue;
+                }
+                startingEnteredAt = _startingEnteredAt;
+                cycleFinishedEnteredAt = _cycleFinishedEnteredAt;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            bool eventChanged = lastProcessed != curEvent;
+
+            if (eventChanged)
+            {
+                lock (_stateLock)
+                {
+                    _automationLastProcessedEvent = curEvent;
+                    _lastPollByEvent[curEvent] = DateTime.MinValue;
+                    _startingEnteredAt = curEvent == 40 ? now : DateTime.MinValue;
+                    _cyclingLastTick = curEvent == 50 ? now : DateTime.MinValue;
+                    _cycleFinishedEnteredAt = curEvent == 60 ? now : DateTime.MinValue;
+                    startingEnteredAt = _startingEnteredAt;
+                    cycleFinishedEnteredAt = _cycleFinishedEnteredAt;
+                }
+                lastPoll = DateTime.MinValue;
+            }
+
+            TimeSpan pollInterval = GetPollIntervalForEvent(curEvent);
+            bool shouldPollNow = lastPoll == DateTime.MinValue || now - lastPoll >= pollInterval;
+
+            bool performedPoll = false;
 
             switch (curEvent)
             {
                 case 10: // Idle
                 {
-                    // Idle keeps the operator-facing registers zeroed while issuing a one-minute
-                    // heartbeat poll to see whether the payment system is waving the update flag.
-                    SetPollInterval(_defaultPollMs);
-                    ResetRunRegistersToZero();
                     if (eventChanged)
                     {
-                        _lastIdlePaymentPoll = DateTime.MinValue;
+                        ResetRunRegistersToZero();
                     }
-
-                    var now = DateTime.UtcNow;
-                    bool shouldPoll = eventChanged || now - _lastIdlePaymentPoll >= TimeSpan.FromMinutes(1);
-                    if (shouldPoll)
+                    if (shouldPollNow && PollPaymentStatus("Idle", pollFullRange: true, ref performedPoll))
                     {
-                        try
-                        {
-                            // Bring in the payment status each minute and reflect it in the UI.
-                            ushort status = ReadUInt16(0x000B);
-                            performedPoll = true;
-                            _lastIdlePaymentPoll = now;
-                            var statusItem = GetRegisterByAddress(0x000B);
-                            if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, status));
-
-                            SynchronizeProgramPriceUpdate(status, pollFullRange: true, ref performedPoll);
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendActivity($"Idle payment poll failed: {ex.Message}");
-                        }
+                        MarkEventPoll(curEvent, now);
                     }
                     break;
                 }
                 case 20: // Program Selection
                 case 21: // Extra Selection
                 {
-                    // These screens stay at zero while echoing the payment-system status every minute.
-                    SetPollInterval(_defaultPollMs);
-                    ResetRunRegistersToZero();
                     if (eventChanged)
                     {
-                        _lastSelectionPaymentPoll = DateTime.MinValue;
+                        ResetRunRegistersToZero();
                     }
-
-                    var now = DateTime.UtcNow;
-                    bool shouldPoll = eventChanged || now - _lastSelectionPaymentPoll >= TimeSpan.FromMinutes(1);
-                    if (shouldPoll)
+                    if (shouldPollNow && PollPaymentStatus("Selection", pollFullRange: true, ref performedPoll))
                     {
-                        try
-                        {
-                            ushort status = ReadUInt16(0x000B);
-                            performedPoll = true;
-                            _lastSelectionPaymentPoll = now;
-                            var statusItem = GetRegisterByAddress(0x000B);
-                            if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, status));
-                            SynchronizeProgramPriceUpdate(status, pollFullRange: true, ref performedPoll);
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendActivity($"Selection payment poll failed: {ex.Message}");
-                        }
+                        MarkEventPoll(curEvent, now);
                     }
                     break;
                 }
                 case 30: // Payment
                 {
-                    // Payment generates pseudo-random totals/program/time once per entry and then
-                    // monitors the slave's payment/discount registers to determine when to advance.
-                    SetPollInterval(_defaultPollMs);
                     if (eventChanged)
                     {
-                        try
-                        {
-                            uint total = (uint)_rng.Next(1, 100000);
-                            ushort program = (ushort)_rng.Next(1, 21);
-                            ushort remaining = (ushort)_rng.Next(5, 46);
-
-                            WriteUdint(0x0003, total);
-                            _modbusClient!.WriteSingleRegister(0x0005, program);
-                            _modbusClient!.WriteSingleRegister(0x0006, remaining);
-
-                            var totalItem = GetRegisterByAddress(0x0003);
-                            if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, total.ToString()));
-                            var programItem = GetRegisterByAddress(0x0005);
-                            if (programItem != null) Ui(() => UpdateRegisterValueDisplay(programItem, program));
-                            var remainingItem = GetRegisterByAddress(0x0006);
-                            if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
-
-                            AppendActivity($"Payment randomised: total={total}, program={program}, remaining={remaining}");
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendActivity($"Payment randomisation failed: {ex.Message}");
-                        }
+                        RandomizePaymentRegisters();
                     }
-
-                    try
+                    if (shouldPollNow && PollPaymentAndAdvance(ref performedPoll))
                     {
-                        // Pull the live payment-system status/amounts so the UI matches the slave.
-                        ushort paymentStatus = ReadUInt16(0x000B);
-                        performedPoll = true;
-                        var statusItem = GetRegisterByAddress(0x000B);
-                        if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, paymentStatus));
-                        SynchronizeProgramPriceUpdate(paymentStatus, pollFullRange: true, ref performedPoll);
-
-                        uint paidAmount = ReadUdint(0x000C);
-                        performedPoll = true;
-                        var paidItem = GetRegisterByAddress(0x000C);
-                        if (paidItem != null) Ui(() => UpdateRegisterValueDisplay(paidItem, paidAmount.ToString()));
-
-                        uint discountAmount = ReadUdint(0x000E);
-                        performedPoll = true;
-                        var discountItem = GetRegisterByAddress(0x000E);
-                        if (discountItem != null) Ui(() => UpdateRegisterValueDisplay(discountItem, discountAmount.ToString()));
-
-                        uint totalToPay = ReadUdint(0x0003);
-                        performedPoll = true;
-                        var totalItem = GetRegisterByAddress(0x0003);
-                        if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, totalToPay.ToString()));
-
-                        // Discount flags mean paid + discount must cover the randomized total.
-                        bool paymentReady = paidAmount >= totalToPay;
-                        bool requireDiscountCheck = (paymentStatus & 0x0002) != 0 || (paymentStatus & 0x0004) != 0;
-                        if (requireDiscountCheck)
-                        {
-                            paymentReady = paidAmount + discountAmount >= totalToPay;
-                        }
-
-                        if (paymentReady)
-                        {
-                            // Hand-off to Starting once the simulated payment is complete.
-                            try
-                            {
-                                _modbusClient!.WriteSingleRegister(0x0001, 40);
-                                var evtItem = GetRegisterByAddress(0x0001);
-                                if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 40));
-                                AppendActivity("Payment satisfied → Starting");
-                            }
-                            catch (Exception ex)
-                            {
-                                AppendActivity($"Failed to advance to Starting: {ex.Message}");
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        AppendActivity($"Payment polling failed: {ex.Message}");
+                        MarkEventPoll(curEvent, now);
                     }
                     break;
                 }
                 case 40: // Starting
                 {
-                    // After five seconds we clear the price and transition into the active cycle.
-                    SetPollInterval(_defaultPollMs);
-                    if (eventChanged)
+                    if (shouldPollNow && PollPaymentStatus("Starting", pollFullRange: true, ref performedPoll))
                     {
-                        _startingEnteredAt = DateTime.UtcNow;
+                        MarkEventPoll(curEvent, now);
                     }
-
-                    if (_startingEnteredAt != DateTime.MinValue && DateTime.UtcNow - _startingEnteredAt >= TimeSpan.FromSeconds(5))
-                    {
-                        try
-                        {
-                            WriteUdint(0x0003, 0u);
-                            var totalItem = GetRegisterByAddress(0x0003);
-                            if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, "0"));
-
-                            _modbusClient!.WriteSingleRegister(0x0001, 50);
-                            var evtItem = GetRegisterByAddress(0x0001);
-                            if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 50));
-                            AppendActivity("Starting complete → Cycling");
-                            _startingEnteredAt = DateTime.MinValue;
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendActivity($"Failed to advance to Cycling: {ex.Message}");
-                        }
-                    }
+                    HandleStartingTransition(now, startingEnteredAt);
                     break;
                 }
                 case 50: // Cycling
                 {
-                    // Decrement Remaining Time every five seconds until we reach zero → Cycle Finished.
-                    SetPollInterval(_defaultPollMs);
-                    if (eventChanged)
+                    if (shouldPollNow && PollPaymentStatus("Cycling", pollFullRange: true, ref performedPoll))
                     {
-                        _cyclingLastTick = DateTime.UtcNow;
+                        MarkEventPoll(curEvent, now);
                     }
-
-                    if (_cyclingLastTick != DateTime.MinValue && DateTime.UtcNow - _cyclingLastTick >= TimeSpan.FromSeconds(5))
-                    {
-                        try
-                        {
-                            ushort remaining = ReadUInt16(0x0006);
-                            performedPoll = true;
-                            var remainingItem = GetRegisterByAddress(0x0006);
-                            if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
-
-                            if (remaining > 0)
-                            {
-                                ushort next = (ushort)(remaining - 1);
-                                _modbusClient!.WriteSingleRegister(0x0006, next);
-                                if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, next));
-                                _cyclingLastTick = DateTime.UtcNow;
-
-                                if (next == 0)
-                                {
-                                    _modbusClient!.WriteSingleRegister(0x0001, 60);
-                                    var evtItem = GetRegisterByAddress(0x0001);
-                                    if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 60));
-                                    AppendActivity("Cycle finished → Cycle Finished");
-                                    _cyclingLastTick = DateTime.MinValue;
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendActivity($"Cycling decrement failed: {ex.Message}");
-                        }
-                    }
+                    HandleCyclingCountdown(now, ref performedPoll);
                     break;
                 }
                 case 60: // Cycle Finished
                 {
-                    // Ten-second dwell before snapping back to Idle and resetting master registers.
-                    SetPollInterval(_defaultPollMs);
-                    if (eventChanged)
+                    if (shouldPollNow && PollPaymentStatus("Cycle Finished", pollFullRange: true, ref performedPoll))
                     {
-                        _cycleFinishedEnteredAt = DateTime.UtcNow;
+                        MarkEventPoll(curEvent, now);
                     }
-
-                    if (_cycleFinishedEnteredAt != DateTime.MinValue && DateTime.UtcNow - _cycleFinishedEnteredAt >= TimeSpan.FromSeconds(10))
+                    HandleCycleFinishedReturn(now, cycleFinishedEnteredAt);
+                    break;
+                }
+                case 999: // Machine Unavailable
+                {
+                    if (shouldPollNow && PollPaymentStatus("Machine Unavailable", pollFullRange: true, ref performedPoll))
                     {
-                        try
-                        {
-                            _modbusClient!.WriteSingleRegister(0x0001, 10);
-                            var evtItem = GetRegisterByAddress(0x0001);
-                            if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 10));
-                            AppendActivity("Cycle finished timeout → Idle");
-                            ResetRunRegistersToZero();
-                            _lastIdlePaymentPoll = DateTime.MinValue;
-                            _cycleFinishedEnteredAt = DateTime.MinValue;
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendActivity($"Failed to return to Idle: {ex.Message}");
-                        }
+                        MarkEventPoll(curEvent, now);
                     }
                     break;
                 }
                 default:
                 {
-                    SetPollInterval(_defaultPollMs);
+                    if (shouldPollNow && PollPaymentStatus("Automation", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
                     break;
                 }
             }
 
-            if (performedPoll) IncrementPollCounter();
+            if (performedPoll)
+            {
+                IncrementPollCounter();
+            }
+        }
+
+        private void HandleManualPolling()
+        {
+            DateTime now = DateTime.UtcNow;
+            if (now - _lastManualPoll < TimeSpan.FromSeconds(2)) return;
+
+            bool performedPoll = false;
+
+            WriteMasterRange0to6();
+            var map = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E), ref performedPoll);
+            if (map.TryGetValue(0x000B, out int statusValue))
+            {
+                SynchronizeProgramPriceUpdate((ushort)(statusValue & 0xFFFF), pollFullRange: true, ref performedPoll);
+            }
+
+            if (performedPoll)
+            {
+                IncrementPollCounter();
+            }
+
+            lock (_stateLock)
+            {
+                _lastManualPoll = now;
+            }
+        }
+
+        private void PrimeEventTrackerFromSlave()
+        {
+            if (_modbusClient is not { Connected: true }) return;
+
+            try
+            {
+                var arr = _modbusClient.ReadHoldingRegisters(0x0001, 1);
+                if (arr.Length == 0) return;
+                int value = arr[0] & 0xFFFF;
+                var evtItem = GetRegisterByAddress(0x0001);
+                if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, value));
+                IncrementPollCounter();
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Event tracker read failed: {ex.Message}");
+            }
+        }
+
+        private void MarkEventPoll(int eventValue, DateTime timestamp)
+        {
+            lock (_stateLock)
+            {
+                _lastPollByEvent[eventValue] = timestamp;
+            }
+        }
+
+        private TimeSpan GetPollIntervalForEvent(int eventValue) => eventValue switch
+        {
+            10 => TimeSpan.FromMinutes(1),
+            20 => TimeSpan.FromSeconds(5),
+            21 => TimeSpan.FromSeconds(5),
+            30 => TimeSpan.FromSeconds(2),
+            40 => TimeSpan.FromSeconds(5),
+            50 => TimeSpan.FromMinutes(1),
+            60 => TimeSpan.FromMinutes(1),
+            999 => TimeSpan.FromMinutes(1),
+            _ => TimeSpan.FromSeconds(5)
+        };
+
+        private bool PollPaymentStatus(string context, bool pollFullRange, ref bool performedPoll)
+        {
+            try
+            {
+                ushort status = ReadUInt16(0x000B);
+                performedPoll = true;
+                var statusItem = GetRegisterByAddress(0x000B);
+                if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, status));
+                SynchronizeProgramPriceUpdate(status, pollFullRange, ref performedPoll);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"{context} payment poll failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void RandomizePaymentRegisters()
+        {
+            try
+            {
+                uint total = (uint)_rng.Next(1, 100000);
+                ushort program = (ushort)_rng.Next(1, 21);
+                ushort remaining = (ushort)_rng.Next(5, 46);
+
+                WriteUdint(0x0003, total);
+                _modbusClient!.WriteSingleRegister(0x0005, program);
+                _modbusClient!.WriteSingleRegister(0x0006, remaining);
+
+                var totalItem = GetRegisterByAddress(0x0003);
+                if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, total.ToString()));
+                var programItem = GetRegisterByAddress(0x0005);
+                if (programItem != null) Ui(() => UpdateRegisterValueDisplay(programItem, program));
+                var remainingItem = GetRegisterByAddress(0x0006);
+                if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
+
+                AppendActivity($"Payment randomised: total={total}, program={program}, remaining={remaining}");
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Payment randomisation failed: {ex.Message}");
+            }
+        }
+
+        private bool PollPaymentAndAdvance(ref bool performedPoll)
+        {
+            try
+            {
+                ushort paymentStatus = ReadUInt16(0x000B);
+                performedPoll = true;
+                var statusItem = GetRegisterByAddress(0x000B);
+                if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, paymentStatus));
+                SynchronizeProgramPriceUpdate(paymentStatus, pollFullRange: true, ref performedPoll);
+
+                uint paidAmount = ReadUdint(0x000C);
+                performedPoll = true;
+                var paidItem = GetRegisterByAddress(0x000C);
+                if (paidItem != null) Ui(() => UpdateRegisterValueDisplay(paidItem, paidAmount.ToString()));
+
+                uint discountAmount = ReadUdint(0x000E);
+                performedPoll = true;
+                var discountItem = GetRegisterByAddress(0x000E);
+                if (discountItem != null) Ui(() => UpdateRegisterValueDisplay(discountItem, discountAmount.ToString()));
+
+                uint totalToPay = ReadUdint(0x0003);
+                performedPoll = true;
+                var totalItem = GetRegisterByAddress(0x0003);
+                if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, totalToPay.ToString()));
+
+                bool paymentReady = paidAmount >= totalToPay;
+                bool requireDiscountCheck = (paymentStatus & 0x0002) != 0 || (paymentStatus & 0x0004) != 0;
+                if (requireDiscountCheck)
+                {
+                    paymentReady = paidAmount + discountAmount >= totalToPay;
+                }
+
+                if (paymentReady)
+                {
+                    try
+                    {
+                        _modbusClient!.WriteSingleRegister(0x0001, 40);
+                        var evtItem = GetRegisterByAddress(0x0001);
+                        if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 40));
+                        AppendActivity("Payment satisfied → Starting");
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendActivity($"Failed to advance to Starting: {ex.Message}");
+                    }
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Payment polling failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void HandleStartingTransition(DateTime now, DateTime enteredAt)
+        {
+            if (enteredAt == DateTime.MinValue) return;
+            if (now - enteredAt < TimeSpan.FromSeconds(5)) return;
+
+            try
+            {
+                WriteUdint(0x0003, 0u);
+                var totalItem = GetRegisterByAddress(0x0003);
+                if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, "0"));
+
+                _modbusClient!.WriteSingleRegister(0x0001, 50);
+                var evtItem = GetRegisterByAddress(0x0001);
+                if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 50));
+                AppendActivity("Starting complete → Cycling");
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to advance to Cycling: {ex.Message}");
+                return;
+            }
+
+            lock (_stateLock)
+            {
+                _startingEnteredAt = DateTime.MinValue;
+            }
+        }
+
+        private void HandleCyclingCountdown(DateTime now, ref bool performedPoll)
+        {
+            bool shouldTick;
+            lock (_stateLock)
+            {
+                if (_cyclingLastTick == DateTime.MinValue)
+                {
+                    _cyclingLastTick = now;
+                    return;
+                }
+
+                shouldTick = now - _cyclingLastTick >= TimeSpan.FromSeconds(5);
+                if (shouldTick)
+                {
+                    _cyclingLastTick = now;
+                }
+            }
+
+            if (!shouldTick) return;
+
+            ushort remaining;
+            var remainingItem = GetRegisterByAddress(0x0006);
+            if (remainingItem?.LastValue is int lastValue)
+            {
+                remaining = (ushort)lastValue;
+            }
+            else
+            {
+                try
+                {
+                    remaining = ReadUInt16(0x0006);
+                    performedPoll = true;
+                    if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
+                }
+                catch (Exception ex)
+                {
+                    AppendActivity($"Cycling decrement failed: {ex.Message}");
+                    return;
+                }
+            }
+
+            if (remaining == 0) return;
+
+            ushort next = (ushort)(remaining - 1);
+            try
+            {
+                _modbusClient!.WriteSingleRegister(0x0006, next);
+                if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, next));
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Cycling decrement failed: {ex.Message}");
+                return;
+            }
+
+            if (next == 0)
+            {
+                try
+                {
+                    _modbusClient!.WriteSingleRegister(0x0001, 60);
+                    var evtItem = GetRegisterByAddress(0x0001);
+                    if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 60));
+                    AppendActivity("Cycle finished → Cycle Finished");
+                    lock (_stateLock)
+                    {
+                        _cycleFinishedEnteredAt = DateTime.UtcNow;
+                        _automationLastProcessedEvent = null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppendActivity($"Failed to advance to Cycle Finished: {ex.Message}");
+                }
+            }
+        }
+
+        private void HandleCycleFinishedReturn(DateTime now, DateTime enteredAt)
+        {
+            if (enteredAt == DateTime.MinValue) return;
+            if (now - enteredAt < TimeSpan.FromSeconds(10)) return;
+
+            try
+            {
+                _modbusClient!.WriteSingleRegister(0x0001, 10);
+                var evtItem = GetRegisterByAddress(0x0001);
+                if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 10));
+                AppendActivity("Cycle finished timeout → Idle");
+                ResetRunRegistersToZero();
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to return to Idle: {ex.Message}");
+                return;
+            }
+
+            lock (_stateLock)
+            {
+                _cycleFinishedEnteredAt = DateTime.MinValue;
+            }
+        }
+
+        private void OnEventTrackerValueObserved(int value)
+        {
+            lock (_stateLock)
+            {
+                int? previous = _lastEventTrackerValue;
+                _lastEventTrackerValue = value;
+                if (previous == value) return;
+
+                _automationLastProcessedEvent = null;
+                _lastPollByEvent[value] = DateTime.MinValue;
+
+                if (value != 40) _startingEnteredAt = DateTime.MinValue;
+                if (value != 50) _cyclingLastTick = DateTime.MinValue;
+                if (value != 60) _cycleFinishedEnteredAt = DateTime.MinValue;
+            }
         }
 
         // ===== Event combobox handler =====
@@ -967,9 +1155,23 @@ namespace ModbusSimV1
         private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
         {
             bool enabled = chkAutomationEnabled.Checked;
-            _lastEventTrackerValue = null;
             AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
-            if (!enabled) SetPollInterval(_defaultPollMs);
+            lock (_stateLock)
+            {
+                _automationLastProcessedEvent = null;
+                _lastPollByEvent.Clear();
+                if (!enabled)
+                {
+                    _startingEnteredAt = DateTime.MinValue;
+                    _cyclingLastTick = DateTime.MinValue;
+                    _cycleFinishedEnteredAt = DateTime.MinValue;
+                }
+            }
+
+            if (enabled)
+            {
+                PrimeEventTrackerFromSlave();
+            }
         }
 
         private void headerPanel_Paint(object? sender, PaintEventArgs e)

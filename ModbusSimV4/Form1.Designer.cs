@@ -43,7 +43,6 @@ namespace ModbusSimV1
             this.cmbPort = new System.Windows.Forms.ComboBox();
             this.lblPort = new System.Windows.Forms.Label();
             this.buttonPanel = new System.Windows.Forms.FlowLayoutPanel();
-            this.btnCyclicEnable = new System.Windows.Forms.Button();
             this.btnRead = new System.Windows.Forms.Button();
             this.btnWrite = new System.Windows.Forms.Button();
             this.grpSelectedRegister = new System.Windows.Forms.GroupBox();
@@ -262,7 +261,6 @@ namespace ModbusSimV1
             // 
             this.buttonPanel.AutoSize = true;
             this.buttonPanel.AutoSizeMode = System.Windows.Forms.AutoSizeMode.GrowAndShrink;
-            this.buttonPanel.Controls.Add(this.btnCyclicEnable);
             this.buttonPanel.Controls.Add(this.btnRead);
             this.buttonPanel.Controls.Add(this.btnWrite);
             this.buttonPanel.Dock = System.Windows.Forms.DockStyle.Fill;
@@ -273,37 +271,24 @@ namespace ModbusSimV1
             this.buttonPanel.TabIndex = 1;
             this.buttonPanel.WrapContents = false;
             // 
-            // btnCyclicEnable
-            // 
-            this.btnCyclicEnable.Enabled = false;
-            this.btnCyclicEnable.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.btnCyclicEnable.Location = new System.Drawing.Point(3, 3);
-            this.btnCyclicEnable.Margin = new System.Windows.Forms.Padding(3, 3, 3, 10);
-            this.btnCyclicEnable.Name = "btnCyclicEnable";
-            this.btnCyclicEnable.Size = new System.Drawing.Size(225, 40);
-            this.btnCyclicEnable.TabIndex = 0;
-            this.btnCyclicEnable.Text = "CYCLIC ENABLE";
-            this.btnCyclicEnable.UseVisualStyleBackColor = true;
-            this.btnCyclicEnable.Click += new System.EventHandler(this.btnCyclicEnable_Click);
-            // 
             // btnRead
-            // 
+            //
             this.btnRead.Enabled = false;
             this.btnRead.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.btnRead.Location = new System.Drawing.Point(3, 53);
-            this.btnRead.Margin = new System.Windows.Forms.Padding(3, 0, 3, 10);
+            this.btnRead.Location = new System.Drawing.Point(3, 3);
+            this.btnRead.Margin = new System.Windows.Forms.Padding(3, 3, 3, 10);
             this.btnRead.Name = "btnRead";
             this.btnRead.Size = new System.Drawing.Size(225, 40);
             this.btnRead.TabIndex = 1;
             this.btnRead.Text = "READ ONCE";
             this.btnRead.UseVisualStyleBackColor = true;
             this.btnRead.Click += new System.EventHandler(this.btnRead_Click);
-            // 
+            //
             // btnWrite
-            // 
+            //
             this.btnWrite.Enabled = false;
             this.btnWrite.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.btnWrite.Location = new System.Drawing.Point(3, 103);
+            this.btnWrite.Location = new System.Drawing.Point(3, 53);
             this.btnWrite.Margin = new System.Windows.Forms.Padding(3, 0, 3, 10);
             this.btnWrite.Name = "btnWrite";
             this.btnWrite.Size = new System.Drawing.Size(225, 40);
@@ -524,7 +509,6 @@ namespace ModbusSimV1
         private System.Windows.Forms.Button btnRefreshPorts;
         private System.Windows.Forms.ComboBox cmbPort;
         private System.Windows.Forms.Label lblPort;
-        private System.Windows.Forms.Button btnCyclicEnable;
         private System.Windows.Forms.Button btnRead;
         private System.Windows.Forms.Button btnWrite;
         private System.Windows.Forms.Label lblSelectedRegisterName;
