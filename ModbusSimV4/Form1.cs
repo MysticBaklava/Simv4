@@ -945,6 +945,70 @@ namespace ModbusSimV1
             if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
         }
 
+        private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
+
+        private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
+        {
+            bool enabled = chkAutomationEnabled.Checked;
+            _lastEventTrackerValue = null;
+            AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
+            if (!enabled) SetPollInterval(_defaultPollMs);
+        }
+
+        private void headerPanel_Paint(object? sender, PaintEventArgs e)
+        {
+            using var pen = new Pen(Color.FromArgb(64, Color.Black));
+            e.Graphics.DrawLine(pen, 0, e.ClipRectangle.Bottom - 1, e.ClipRectangle.Right, e.ClipRectangle.Bottom - 1);
+        }
+
+        private void flowRegisters_Paint(object? sender, PaintEventArgs e)
+        {
+            // No custom painting required; method exists to satisfy designer hook.
+        }
+
+        private void label1_Click(object? sender, EventArgs e)
+        {
+            // Intentionally left empty; label is informational only.
+        }
+
+        private void lstActivity_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            // Keep the activity log read-only by clearing the selection.
+            if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
+        }
+
+        private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
+
+        private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
+        {
+            bool enabled = chkAutomationEnabled.Checked;
+            _lastEventTrackerValue = null;
+            AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
+            if (!enabled) SetPollInterval(_defaultPollMs);
+        }
+
+        private void headerPanel_Paint(object? sender, PaintEventArgs e)
+        {
+            using var pen = new Pen(Color.FromArgb(64, Color.Black));
+            e.Graphics.DrawLine(pen, 0, e.ClipRectangle.Bottom - 1, e.ClipRectangle.Right, e.ClipRectangle.Bottom - 1);
+        }
+
+        private void flowRegisters_Paint(object? sender, PaintEventArgs e)
+        {
+            // No custom painting required; method exists to satisfy designer hook.
+        }
+
+        private void label1_Click(object? sender, EventArgs e)
+        {
+            // Intentionally left empty; label is informational only.
+        }
+
+        private void lstActivity_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            // Keep the activity log read-only by clearing the selection.
+            if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
+        }
+
         // ===== misc UI =====
         private void FlowRegisters_Resize(object? sender, EventArgs e)
         { int width = flowRegisters.ClientSize.Width - flowRegisters.Padding.Horizontal - 8; foreach (Control c in flowRegisters.Controls) c.Width = Math.Max(200, width); }
