@@ -4,6 +4,8 @@ using System.ComponentModel;
 using System.Drawing;
 using System.IO.Ports;
 using System.Linq;
+using System.Reflection;
+using System.Threading;
 using System.Windows.Forms;
 using EasyModbus;
 
@@ -19,6 +21,12 @@ namespace ModbusSimV1
         private RegisterItem? _selectedRegister;
         private bool _isPolling;
         private const bool SWAP_WORDS = true;
+        private const int RxTxLogCapacity = 500;
+        private static readonly PropertyInfo? SendDataProperty = typeof(ModbusClient).GetProperty("SendData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly PropertyInfo? ReceiveDataProperty = typeof(ModbusClient).GetProperty("ReceiveData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly FieldInfo? SendDataField = typeof(ModbusClient).GetField("sendData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly FieldInfo? ReceiveDataField = typeof(ModbusClient).GetField("receiveData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private int _rxTxSequence;
 
         // ===== Event dropdown on the right panel =====
         private readonly Dictionary<int, string> _eventMapByValue = new()
@@ -71,6 +79,7 @@ namespace ModbusSimV1
             grpAutomation.Text = "Automation";
             chkAutomationEnabled.Text = "Run automation";
             lblActivity.Text = "Activity Log";
+            lblRxTx.Text = "RX/TX Log (hex)";
 
             // Build Event dropdown in the automation box (designer must have cmbEvent + lblEvent)
             _eventMapByName = _eventMapByValue.ToDictionary(kv => kv.Value, kv => kv.Key);
@@ -304,8 +313,10 @@ namespace ModbusSimV1
             {
                 DisconnectInternal();
                 _modbusClient = new ModbusClient(portName) { Baudrate = 9600, Parity = Parity.Even, StopBits = StopBits.One, UnitIdentifier = 1 };
+                AttachClientEvents(_modbusClient);
                 _modbusClient.Connect();
                 _connectedPortName = portName;
+                ResetRxTxLog();
                 AppendActivity($"{portName} Connected");
             }
             catch (Exception ex)
@@ -318,10 +329,14 @@ namespace ModbusSimV1
         private void DisconnectInternal()
         {
             StopCyclicPolling();
-            if (_modbusClient is { Connected: true })
+            if (_modbusClient is { } existing)
             {
-                try { _modbusClient.Disconnect(); AppendActivity("Disconnected."); }
-                catch (Exception ex) { AppendActivity($"Disconnect error: {ex.Message}"); }
+                DetachClientEvents(existing);
+                if (existing.Connected)
+                {
+                    try { existing.Disconnect(); AppendActivity("Disconnected."); }
+                    catch (Exception ex) { AppendActivity($"Disconnect error: {ex.Message}"); }
+                }
             }
             _modbusClient = null; _connectedPortName = null;
         }
@@ -945,68 +960,9 @@ namespace ModbusSimV1
             if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
         }
 
-        private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
-
-        private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
+        private void lstRxTx_SelectedIndexChanged(object? sender, EventArgs e)
         {
-            bool enabled = chkAutomationEnabled.Checked;
-            _lastEventTrackerValue = null;
-            AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
-            if (!enabled) SetPollInterval(_defaultPollMs);
-        }
-
-        private void headerPanel_Paint(object? sender, PaintEventArgs e)
-        {
-            using var pen = new Pen(Color.FromArgb(64, Color.Black));
-            e.Graphics.DrawLine(pen, 0, e.ClipRectangle.Bottom - 1, e.ClipRectangle.Right, e.ClipRectangle.Bottom - 1);
-        }
-
-        private void flowRegisters_Paint(object? sender, PaintEventArgs e)
-        {
-            // No custom painting required; method exists to satisfy designer hook.
-        }
-
-        private void label1_Click(object? sender, EventArgs e)
-        {
-            // Intentionally left empty; label is informational only.
-        }
-
-        private void lstActivity_SelectedIndexChanged(object? sender, EventArgs e)
-        {
-            // Keep the activity log read-only by clearing the selection.
-            if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
-        }
-
-        private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
-
-        private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
-        {
-            bool enabled = chkAutomationEnabled.Checked;
-            _lastEventTrackerValue = null;
-            AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
-            if (!enabled) SetPollInterval(_defaultPollMs);
-        }
-
-        private void headerPanel_Paint(object? sender, PaintEventArgs e)
-        {
-            using var pen = new Pen(Color.FromArgb(64, Color.Black));
-            e.Graphics.DrawLine(pen, 0, e.ClipRectangle.Bottom - 1, e.ClipRectangle.Right, e.ClipRectangle.Bottom - 1);
-        }
-
-        private void flowRegisters_Paint(object? sender, PaintEventArgs e)
-        {
-            // No custom painting required; method exists to satisfy designer hook.
-        }
-
-        private void label1_Click(object? sender, EventArgs e)
-        {
-            // Intentionally left empty; label is informational only.
-        }
-
-        private void lstActivity_SelectedIndexChanged(object? sender, EventArgs e)
-        {
-            // Keep the activity log read-only by clearing the selection.
-            if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
+            if (lstRxTx.SelectedIndex >= 0) lstRxTx.ClearSelected();
         }
 
         // ===== misc UI =====
@@ -1022,6 +978,81 @@ namespace ModbusSimV1
                 while (lstActivity.Items.Count > 300) lstActivity.Items.RemoveAt(lstActivity.Items.Count - 1);
             }
             if (InvokeRequired) BeginInvoke((Action)DoAppend); else DoAppend();
+        }
+
+        private void AppendRxTx(bool isTransmit, byte[] data)
+        {
+            if (data.Length == 0) return;
+            var hex = BitConverter.ToString(data).Replace("-", " ");
+            int sequence = Interlocked.Increment(ref _rxTxSequence);
+            string direction = isTransmit ? "Tx" : "Rx";
+            string line = $"{sequence:D6}-> {direction}::{hex}";
+
+            void DoAppend()
+            {
+                lstRxTx.Items.Insert(0, line);
+                while (lstRxTx.Items.Count > RxTxLogCapacity)
+                {
+                    lstRxTx.Items.RemoveAt(lstRxTx.Items.Count - 1);
+                }
+            }
+
+            if (InvokeRequired) BeginInvoke((Action)DoAppend); else DoAppend();
+        }
+
+        private void ResetRxTxLog()
+        {
+            _rxTxSequence = 0;
+            void DoReset() => lstRxTx.Items.Clear();
+            if (InvokeRequired) BeginInvoke((Action)DoReset); else DoReset();
+        }
+
+        private void AttachClientEvents(ModbusClient client)
+        {
+            client.SendDataChanged += OnModbusSendDataChanged;
+            client.ReceiveDataChanged += OnModbusReceiveDataChanged;
+        }
+
+        private void DetachClientEvents(ModbusClient client)
+        {
+            client.SendDataChanged -= OnModbusSendDataChanged;
+            client.ReceiveDataChanged -= OnModbusReceiveDataChanged;
+        }
+
+        private void OnModbusSendDataChanged(object sender)
+        {
+            if (sender is not ModbusClient client) return;
+            var buffer = GetClientBuffer(client, SendDataProperty, SendDataField);
+            if (buffer != null && buffer.Length > 0) AppendRxTx(true, buffer);
+        }
+
+        private void OnModbusReceiveDataChanged(object sender)
+        {
+            if (sender is not ModbusClient client) return;
+            var buffer = GetClientBuffer(client, ReceiveDataProperty, ReceiveDataField);
+            if (buffer != null && buffer.Length > 0) AppendRxTx(false, buffer);
+        }
+
+        private static byte[]? GetClientBuffer(ModbusClient client, PropertyInfo? property, FieldInfo? field)
+        {
+            if (property != null && property.GetValue(client) is byte[] propData && propData.Length > 0)
+            {
+                var copy = new byte[propData.Length];
+                Buffer.BlockCopy(propData, 0, copy, 0, propData.Length);
+                return copy;
+            }
+
+            if (field != null && field.GetValue(client) is byte[] fieldData && fieldData.Length > 0)
+            {
+                int length = fieldData.Length;
+                while (length > 0 && fieldData[length - 1] == 0) length--;
+                if (length <= 0) return null;
+                var copy = new byte[length];
+                Buffer.BlockCopy(fieldData, 0, copy, 0, length);
+                return copy;
+            }
+
+            return null;
         }
 
         // ===== inner types =====
