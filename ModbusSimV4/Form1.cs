@@ -70,6 +70,14 @@ namespace ModbusSimV1
         private DateTime _cycleFinishedEnteredAt = DateTime.MinValue;
         private DateTime _lastManualPoll = DateTime.MinValue;
 
+        // Timestamp bookkeeping for automation throttling and state transitions.
+        private DateTime _lastIdlePaymentPoll = DateTime.MinValue;
+        private DateTime _lastSelectionPaymentPoll = DateTime.MinValue;
+        private bool _idlePaymentHandshakeRaised;
+        private DateTime _startingEnteredAt = DateTime.MinValue;
+        private DateTime _cyclingLastTick = DateTime.MinValue;
+        private DateTime _cycleFinishedEnteredAt = DateTime.MinValue;
+
         public Form1()
         {
             InitializeComponent();
