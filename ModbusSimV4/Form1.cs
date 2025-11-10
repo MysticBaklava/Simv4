@@ -33,6 +33,32 @@ namespace ModbusSimV1
         private readonly Dictionary<int, DateTime> _lastPollByEvent = new();
         private int? _automationLastProcessedEvent;
 
+        // Centralised register map – keeping all addresses in one place makes future table updates
+        // significantly less error-prone than sprinkling literals throughout the file.
+        private const int RegVersionNumber = 0x0000;
+        private const int RegControllerStatus = 0x0001;
+        private const int RegEventTracker = 0x0002;
+        private const int RegPollCounter = 0x0003;
+        private const int RegTotalPriceToPay = 0x0004;
+        private const int RegSelectedProgramNumber = 0x0006;
+        private const int RegRemainingTime = 0x0007;
+        private const int RegPaymentSystemStatus = 0x000C;
+        private const int RegPaidAmount = 0x000D;
+        private const int RegDiscountAmount = 0x000F;
+        private const int RegCurrency = 0x0015;
+        private const int RegProgramPriceStart = 0x0016;   // Program Price 1 (UDINT, two words)
+        private const int RegProgramPriceEnd = 0x003C;     // Program Price 20 (UDINT, two words)
+        private const int RegExtraRinseModifier = 0x003E;
+        private const int RegExtraSoapModifier = 0x0040;
+        private const int RegExtraPrewashModifier = 0x0042;
+        private const int RegReservedEnd = 0x0046;         // Last reserved slot from the provided table
+
+        // Program price synchronisation sweeps the entire payment table anytime the slave raises the
+        // “Program Price Update Available” bit.  Capture the span once so every caller uses the same
+        // boundaries.
+        private const int RegPriceTablePollStart = RegPaymentSystemStatus;
+        private const int RegPriceTablePollEnd = RegReservedEnd;
+
         // Helpers for word/byte conversions and bounded RX/TX log storage.
         private const bool SWAP_WORDS = true;
         private const int RxTxLogCapacity = 500;
@@ -71,6 +97,12 @@ namespace ModbusSimV1
         private DateTime _lastManualPoll = DateTime.MinValue;
 
         // Timestamp bookkeeping for automation throttling and state transitions.
+        private DateTime _startingEnteredAt = DateTime.MinValue;
+        private DateTime _cyclingLastTick = DateTime.MinValue;
+        private DateTime _cycleFinishedEnteredAt = DateTime.MinValue;
+        private DateTime _lastManualPoll = DateTime.MinValue;
+
+        // Timestamp bookkeeping for automation throttling and state transitions.
         private DateTime _lastIdlePaymentPoll = DateTime.MinValue;
         private DateTime _lastSelectionPaymentPoll = DateTime.MinValue;
         private bool _idlePaymentHandshakeRaised;
@@ -86,7 +118,7 @@ namespace ModbusSimV1
             cmbEvent.Items.AddRange(_eventMapByValue.Values.ToArray());
 
             // default selection (sync to current Event Tracker if present)
-            var evt = GetRegisterByAddress(0x0001);
+            var evt = GetRegisterByAddress(RegEventTracker);
             int initVal = evt?.LastValue ?? 10;
             if (_eventMapByValue.TryGetValue(initVal, out var initLabel))
                 cmbEvent.SelectedItem = initLabel;
@@ -152,40 +184,40 @@ namespace ModbusSimV1
             _registerItems.Clear();
             var items = new List<RegisterItem>
             {
-                new RegisterItem { Name = "Controller Status", Address = 0x0000, ChangeableBy = "MASTER", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update OK, Bit1=Overpayment Enabled", Description = "Vector Controller Status" },
-                new RegisterItem { Name = "Event Tracker", Address = 0x0001, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Changes depending on the machine page." },
-                new RegisterItem { Name = "Poll Counter", Address = 0x0002, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Increased by 1 every poll" },
-                new RegisterItem { Name = "Total Price To Pay", Address = 0x0003, ChangeableBy = "MASTER", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Selected program due amount." },
-                new RegisterItem { Name = "Selected Program No", Address = 0x0005, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 255", Description = "Selected program number by customer" },
-                new RegisterItem { Name = "Remaining Time (Min.)", Address = 0x0006, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 9999", Description = "Current cycle remaining time" },
-                new RegisterItem { Name = "Payment System Status", Address = 0x000B, ChangeableBy = "SLAVE", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update, Bit1=Discount, Bit2=System Update", Description = "Payment system status bits." },
-                new RegisterItem { Name = "Paid Amount", Address = 0x000C, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Total paid amount in current txn." },
-                new RegisterItem { Name = "Discount Amount", Address = 0x000E, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Applied discount." },
-                new RegisterItem { Name = "Currency", Address = 0x0014, ChangeableBy = "SLAVE", Type = "UINT", Size = "1", ValueRange = "0-5", Description = "0=None 1=Token 2=USD 3=TL 4=EUR 5=GBP" },
-                // 0x0015..0x0041 prices/modifiers — keep as in your file
-                new RegisterItem { Name = "Program 1 Price", Address = 0x0015, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 1 Price" },
-                new RegisterItem { Name = "Program 2 Price", Address = 0x0017, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 2 Price" },
-                new RegisterItem { Name = "Program 3 Price", Address = 0x0019, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 3 Price" },
-                new RegisterItem { Name = "Program 4 Price", Address = 0x001B, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 4 Price" },
-                new RegisterItem { Name = "Program 5 Price", Address = 0x001D, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 5 Price" },
-                new RegisterItem { Name = "Program 6 Price", Address = 0x001F, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 6 Price" },
-                new RegisterItem { Name = "Program 7 Price", Address = 0x0021, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 7 Price" },
-                new RegisterItem { Name = "Program 8 Price", Address = 0x0023, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 8 Price" },
-                new RegisterItem { Name = "Program 9 Price", Address = 0x0025, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 9 Price" },
-                new RegisterItem { Name = "Program 10 Price", Address = 0x0027, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 10 Price" },
-                new RegisterItem { Name = "Program 11 Price", Address = 0x0029, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 11 Price" },
-                new RegisterItem { Name = "Program 12 Price", Address = 0x002B, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 12 Price" },
-                new RegisterItem { Name = "Program 13 Price", Address = 0x002D, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 13 Price" },
-                new RegisterItem { Name = "Program 14 Price", Address = 0x002F, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 14 Price" },
-                new RegisterItem { Name = "Program 15 Price", Address = 0x0031, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 15 Price" },
-                new RegisterItem { Name = "Program 16 Price", Address = 0x0033, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 16 Price" },
-                new RegisterItem { Name = "Program 17 Price", Address = 0x0035, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 17 Price" },
-                new RegisterItem { Name = "Program 18 Price", Address = 0x0037, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 18 Price" },
-                new RegisterItem { Name = "Program 19 Price", Address = 0x0039, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 19 Price" },
-                new RegisterItem { Name = "Program 20 Price", Address = 0x003B, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 20 Price" },
-                new RegisterItem { Name = "Extra Rinse Modifier", Address = 0x003D, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Rinse Modifier" },
-                new RegisterItem { Name = "Extra Soap Modifier", Address = 0x003F, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Soap Modifier" },
-                new RegisterItem { Name = "Extra Prewash Modifier", Address = 0x0041, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Prewash Modifier" },
+                new RegisterItem { Name = "Version Number", Address = RegVersionNumber, ChangeableBy = "SLAVE", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Simulator software version.", LastValue = 1 },
+                new RegisterItem { Name = "Controller Status", Address = RegControllerStatus, ChangeableBy = "MASTER", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update OK, Bit1=Overpayment Enabled", Description = "Vector Controller Status" },
+                new RegisterItem { Name = "Event Tracker", Address = RegEventTracker, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Changes depending on the machine page." },
+                new RegisterItem { Name = "Poll Counter", Address = RegPollCounter, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Increased by 1 every poll" },
+                new RegisterItem { Name = "Total Price To Pay", Address = RegTotalPriceToPay, ChangeableBy = "MASTER", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Selected program due amount." },
+                new RegisterItem { Name = "Selected Program No", Address = RegSelectedProgramNumber, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 255", Description = "Selected program number by customer" },
+                new RegisterItem { Name = "Remaining Time (Min.)", Address = RegRemainingTime, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 9999", Description = "Current cycle remaining time" },
+                new RegisterItem { Name = "Payment System Status", Address = RegPaymentSystemStatus, ChangeableBy = "SLAVE", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update, Bit1=Discount, Bit2=System Update", Description = "Payment system status bits." },
+                new RegisterItem { Name = "Paid Amount", Address = RegPaidAmount, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Total paid amount in current txn." },
+                new RegisterItem { Name = "Discount Amount", Address = RegDiscountAmount, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Applied discount." },
+                new RegisterItem { Name = "Currency", Address = RegCurrency, ChangeableBy = "SLAVE", Type = "UINT", Size = "1", ValueRange = "0-5", Description = "0=None 1=Token 2=USD 3=TL 4=EUR 5=GBP" },
+                new RegisterItem { Name = "Program 1 Price", Address = RegProgramPriceStart + 0, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 1 Price" },
+                new RegisterItem { Name = "Program 2 Price", Address = RegProgramPriceStart + 0x0002, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 2 Price" },
+                new RegisterItem { Name = "Program 3 Price", Address = RegProgramPriceStart + 0x0004, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 3 Price" },
+                new RegisterItem { Name = "Program 4 Price", Address = RegProgramPriceStart + 0x0006, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 4 Price" },
+                new RegisterItem { Name = "Program 5 Price", Address = RegProgramPriceStart + 0x0008, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 5 Price" },
+                new RegisterItem { Name = "Program 6 Price", Address = RegProgramPriceStart + 0x000A, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 6 Price" },
+                new RegisterItem { Name = "Program 7 Price", Address = RegProgramPriceStart + 0x000C, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 7 Price" },
+                new RegisterItem { Name = "Program 8 Price", Address = RegProgramPriceStart + 0x000E, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 8 Price" },
+                new RegisterItem { Name = "Program 9 Price", Address = RegProgramPriceStart + 0x0010, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 9 Price" },
+                new RegisterItem { Name = "Program 10 Price", Address = RegProgramPriceStart + 0x0012, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 10 Price" },
+                new RegisterItem { Name = "Program 11 Price", Address = RegProgramPriceStart + 0x0014, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 11 Price" },
+                new RegisterItem { Name = "Program 12 Price", Address = RegProgramPriceStart + 0x0016, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 12 Price" },
+                new RegisterItem { Name = "Program 13 Price", Address = RegProgramPriceStart + 0x0018, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 13 Price" },
+                new RegisterItem { Name = "Program 14 Price", Address = RegProgramPriceStart + 0x001A, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 14 Price" },
+                new RegisterItem { Name = "Program 15 Price", Address = RegProgramPriceStart + 0x001C, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 15 Price" },
+                new RegisterItem { Name = "Program 16 Price", Address = RegProgramPriceStart + 0x001E, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 16 Price" },
+                new RegisterItem { Name = "Program 17 Price", Address = RegProgramPriceStart + 0x0020, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 17 Price" },
+                new RegisterItem { Name = "Program 18 Price", Address = RegProgramPriceStart + 0x0022, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 18 Price" },
+                new RegisterItem { Name = "Program 19 Price", Address = RegProgramPriceStart + 0x0024, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 19 Price" },
+                new RegisterItem { Name = "Program 20 Price", Address = RegProgramPriceEnd, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 20 Price" },
+                new RegisterItem { Name = "Extra Rinse Modifier", Address = RegExtraRinseModifier, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Rinse Modifier" },
+                new RegisterItem { Name = "Extra Soap Modifier", Address = RegExtraSoapModifier, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Soap Modifier" },
+                new RegisterItem { Name = "Extra Prewash Modifier", Address = RegExtraPrewashModifier, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Prewash Modifier" },
             };
             foreach (var it in items)
                 if (string.Equals(it.Type, "UDINT", StringComparison.OrdinalIgnoreCase)) it.WordLength = 2;
@@ -347,6 +379,7 @@ namespace ModbusSimV1
                 ResetRxTxLog();
                 AppendActivity($"{portName} Connected");
                 EnsurePollingTimerRunning();
+                SeedVersionRegister();
             }
             catch (Exception ex)
             { AppendActivity($"Connection Error: {ex.Message}"); MessageBox.Show($"Could not connect: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); DisconnectInternal(); }
@@ -458,7 +491,7 @@ namespace ModbusSimV1
         private void UpdateRegisterValueDisplay(RegisterItem item, int value)
         {
             item.LastValue = value;
-            if (item.Address == 0x0001) // Event Tracker -> sync combo
+            if (item.Address == RegEventTracker) // Event Tracker -> sync combo
             {
                 if (_eventMapByValue.TryGetValue(value, out var label))
                 {
@@ -480,6 +513,22 @@ namespace ModbusSimV1
         {
             if (_isPolling) return; _isPolling = true;
             System.Threading.Tasks.Task.Run(() => { try { lock (_pollLock) { CyclicStep(); } } finally { _isPolling = false; } });
+        }
+
+        private void EnsurePollingTimerRunning()
+        {
+            if (!_pollTimer.Enabled)
+            {
+                _pollTimer.Start();
+            }
+        }
+
+        private void StopPollingTimer()
+        {
+            if (_pollTimer.Enabled)
+            {
+                _pollTimer.Stop();
+            }
         }
 
         private void EnsurePollingTimerRunning()
@@ -534,10 +583,10 @@ namespace ModbusSimV1
         }
         private void WriteMasterRange0to6()
         {
-            if (!EnsureConnected(false)) return; var items = GetItemsInRange(0x0000, 0x0006).Where(i => i.IsWritable).ToList();
+            if (!EnsureConnected(false)) return; var items = GetItemsInRange(RegVersionNumber, RegRemainingTime).Where(i => i.IsWritable).ToList();
             foreach (var item in items)
             {
-                if (item.Address == 0x0002) continue; // poll counter handled separately
+                if (item.Address == RegPollCounter) continue; // poll counter handled separately
                 if (!_registerDisplays.TryGetValue(item.Address, out var disp)) continue;
                 try
                 {
@@ -553,6 +602,21 @@ namespace ModbusSimV1
             }
         }
 
+        private void SeedVersionRegister()
+        {
+            if (!EnsureConnected(false)) return;
+            try
+            {
+                _modbusClient!.WriteSingleRegister(RegVersionNumber, 1);
+                var versionItem = GetRegisterByAddress(RegVersionNumber);
+                if (versionItem != null) Ui(() => UpdateRegisterValueDisplay(versionItem, 1));
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to seed version register: {ex.Message}");
+            }
+        }
+
         // Ensure the master-writable run registers (total/program/time) are reset to zero.
         // We invoke this whenever an automation state requires a clean slate before continuing.
         private void ResetRunRegistersToZero()
@@ -560,21 +624,21 @@ namespace ModbusSimV1
             try
             {
                 bool totalNeedsZero = true;
-                if (_registerDisplays.TryGetValue(0x0003, out var totalDisplay))
+                if (_registerDisplays.TryGetValue(RegTotalPriceToPay, out var totalDisplay))
                 {
                     string text = UiGet(() => totalDisplay.ValueBox.Text);
                     totalNeedsZero = !string.Equals(text, "0", StringComparison.Ordinal);
                 }
 
                 bool programNeedsZero = true;
-                if (_registerDisplays.TryGetValue(0x0005, out var programDisplay))
+                if (_registerDisplays.TryGetValue(RegSelectedProgramNumber, out var programDisplay))
                 {
                     string text = UiGet(() => programDisplay.ValueBox.Text);
                     programNeedsZero = !string.Equals(text, "0", StringComparison.Ordinal);
                 }
 
                 bool remainingNeedsZero = true;
-                if (_registerDisplays.TryGetValue(0x0006, out var remainingDisplay))
+                if (_registerDisplays.TryGetValue(RegRemainingTime, out var remainingDisplay))
                 {
                     string text = UiGet(() => remainingDisplay.ValueBox.Text);
                     remainingNeedsZero = !string.Equals(text, "0", StringComparison.Ordinal);
@@ -582,22 +646,22 @@ namespace ModbusSimV1
 
                 if (totalNeedsZero)
                 {
-                    WriteUdint(0x0003, 0u);
-                    var totalItem = GetRegisterByAddress(0x0003);
+                    WriteUdint(RegTotalPriceToPay, 0u);
+                    var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
                     if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, "0"));
                 }
 
                 if (programNeedsZero)
                 {
-                    _modbusClient!.WriteSingleRegister(0x0005, 0);
-                    var programItem = GetRegisterByAddress(0x0005);
+                    _modbusClient!.WriteSingleRegister(RegSelectedProgramNumber, 0);
+                    var programItem = GetRegisterByAddress(RegSelectedProgramNumber);
                     if (programItem != null) Ui(() => UpdateRegisterValueDisplay(programItem, 0));
                 }
 
                 if (remainingNeedsZero)
                 {
-                    _modbusClient!.WriteSingleRegister(0x0006, 0);
-                    var remainingItem = GetRegisterByAddress(0x0006);
+                    _modbusClient!.WriteSingleRegister(RegRemainingTime, 0);
+                    var remainingItem = GetRegisterByAddress(RegRemainingTime);
                     if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, 0));
                 }
             }
@@ -607,8 +671,9 @@ namespace ModbusSimV1
             }
         }
 
-        // The payment system raises bit0 of 0x000B to signal that updated program prices are
-        // available.  Callers can request a full sweep of the price table (0x000B–0x0041) while
+        // The payment system raises bit0 of the Payment System Status register to signal that
+        // updated program prices are available.  Callers can request a full sweep of the price table
+        // (0x000C–0x0046 in the new layout) while
         // the flag is raised; regardless, we mirror the acknowledgement by forcing controller-
         // status bit0 high.  Once the slave drops its availability flag we immediately clear our
         // acknowledgement.
@@ -620,7 +685,7 @@ namespace ModbusSimV1
             {
                 if (pollFullRange)
                 {
-                    BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x0041), ref performedPoll);
+                    BulkReadRangeUpdate(GetItemsInRange(RegPriceTablePollStart, RegPriceTablePollEnd), ref performedPoll);
                 }
 
                 // Availability asserted → acknowledge by raising the controller's finished flag.
@@ -642,7 +707,7 @@ namespace ModbusSimV1
         private void SetControllerStatusBit0(bool on, ref bool performedPoll)
         {
             ushort current;
-            var statusItem = GetRegisterByAddress(0x0000);
+            var statusItem = GetRegisterByAddress(RegControllerStatus);
             if (statusItem?.LastValue is int last)
             {
                 current = (ushort)last;
@@ -651,7 +716,7 @@ namespace ModbusSimV1
             {
                 try
                 {
-                    current = ReadUInt16(0x0000);
+                    current = ReadUInt16(RegControllerStatus);
                     performedPoll = true;
                     if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, current));
                 }
@@ -667,7 +732,7 @@ namespace ModbusSimV1
 
             try
             {
-                _modbusClient!.WriteSingleRegister(0x0000, desired);
+                _modbusClient!.WriteSingleRegister(RegControllerStatus, desired);
                 if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, desired));
             }
             catch (Exception ex)
@@ -676,16 +741,16 @@ namespace ModbusSimV1
             }
         }
 
-        // Bump Poll Counter (0x0002) and mirror the value in the register card.  Only invoked
+        // Bump Poll Counter (0x0003) and mirror the value in the register card.  Only invoked
         // after an actual Modbus read/write to stay faithful to the hardware behavior.
         private void IncrementPollCounter()
         {
             try
             {
-                ushort current = ReadUInt16(0x0002);
+                ushort current = ReadUInt16(RegPollCounter);
                 ushort next = (ushort)((current + 1) & 0xFFFF);
-                _modbusClient!.WriteSingleRegister(0x0002, next);
-                var pollItem = GetRegisterByAddress(0x0002);
+                _modbusClient!.WriteSingleRegister(RegPollCounter, next);
+                var pollItem = GetRegisterByAddress(RegPollCounter);
                 if (pollItem != null) Ui(() => UpdateRegisterValueDisplay(pollItem, next));
             }
             catch (Exception ex)
@@ -844,8 +909,8 @@ namespace ModbusSimV1
             bool performedPoll = false;
 
             WriteMasterRange0to6();
-            var map = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E), ref performedPoll);
-            if (map.TryGetValue(0x000B, out int statusValue))
+            var map = BulkReadRangeUpdate(GetItemsInRange(RegPaymentSystemStatus, RegDiscountAmount), ref performedPoll);
+            if (map.TryGetValue(RegPaymentSystemStatus, out int statusValue))
             {
                 SynchronizeProgramPriceUpdate((ushort)(statusValue & 0xFFFF), pollFullRange: true, ref performedPoll);
             }
@@ -867,10 +932,10 @@ namespace ModbusSimV1
 
             try
             {
-                var arr = _modbusClient.ReadHoldingRegisters(0x0001, 1);
+                var arr = _modbusClient.ReadHoldingRegisters(RegEventTracker, 1);
                 if (arr.Length == 0) return;
                 int value = arr[0] & 0xFFFF;
-                var evtItem = GetRegisterByAddress(0x0001);
+                var evtItem = GetRegisterByAddress(RegEventTracker);
                 if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, value));
                 IncrementPollCounter();
             }
@@ -905,9 +970,9 @@ namespace ModbusSimV1
         {
             try
             {
-                ushort status = ReadUInt16(0x000B);
+                ushort status = ReadUInt16(RegPaymentSystemStatus);
                 performedPoll = true;
-                var statusItem = GetRegisterByAddress(0x000B);
+                var statusItem = GetRegisterByAddress(RegPaymentSystemStatus);
                 if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, status));
                 SynchronizeProgramPriceUpdate(status, pollFullRange, ref performedPoll);
                 return true;
@@ -927,15 +992,15 @@ namespace ModbusSimV1
                 ushort program = (ushort)_rng.Next(1, 21);
                 ushort remaining = (ushort)_rng.Next(5, 46);
 
-                WriteUdint(0x0003, total);
-                _modbusClient!.WriteSingleRegister(0x0005, program);
-                _modbusClient!.WriteSingleRegister(0x0006, remaining);
+                WriteUdint(RegTotalPriceToPay, total);
+                _modbusClient!.WriteSingleRegister(RegSelectedProgramNumber, program);
+                _modbusClient!.WriteSingleRegister(RegRemainingTime, remaining);
 
-                var totalItem = GetRegisterByAddress(0x0003);
+                var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
                 if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, total.ToString()));
-                var programItem = GetRegisterByAddress(0x0005);
+                var programItem = GetRegisterByAddress(RegSelectedProgramNumber);
                 if (programItem != null) Ui(() => UpdateRegisterValueDisplay(programItem, program));
-                var remainingItem = GetRegisterByAddress(0x0006);
+                var remainingItem = GetRegisterByAddress(RegRemainingTime);
                 if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
 
                 AppendActivity($"Payment randomised: total={total}, program={program}, remaining={remaining}");
@@ -950,25 +1015,25 @@ namespace ModbusSimV1
         {
             try
             {
-                ushort paymentStatus = ReadUInt16(0x000B);
+                ushort paymentStatus = ReadUInt16(RegPaymentSystemStatus);
                 performedPoll = true;
-                var statusItem = GetRegisterByAddress(0x000B);
+                var statusItem = GetRegisterByAddress(RegPaymentSystemStatus);
                 if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, paymentStatus));
                 SynchronizeProgramPriceUpdate(paymentStatus, pollFullRange: true, ref performedPoll);
 
-                uint paidAmount = ReadUdint(0x000C);
+                uint paidAmount = ReadUdint(RegPaidAmount);
                 performedPoll = true;
-                var paidItem = GetRegisterByAddress(0x000C);
+                var paidItem = GetRegisterByAddress(RegPaidAmount);
                 if (paidItem != null) Ui(() => UpdateRegisterValueDisplay(paidItem, paidAmount.ToString()));
 
-                uint discountAmount = ReadUdint(0x000E);
+                uint discountAmount = ReadUdint(RegDiscountAmount);
                 performedPoll = true;
-                var discountItem = GetRegisterByAddress(0x000E);
+                var discountItem = GetRegisterByAddress(RegDiscountAmount);
                 if (discountItem != null) Ui(() => UpdateRegisterValueDisplay(discountItem, discountAmount.ToString()));
 
-                uint totalToPay = ReadUdint(0x0003);
+                uint totalToPay = ReadUdint(RegTotalPriceToPay);
                 performedPoll = true;
-                var totalItem = GetRegisterByAddress(0x0003);
+                var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
                 if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, totalToPay.ToString()));
 
                 bool paymentReady = paidAmount >= totalToPay;
@@ -982,8 +1047,8 @@ namespace ModbusSimV1
                 {
                     try
                     {
-                        _modbusClient!.WriteSingleRegister(0x0001, 40);
-                        var evtItem = GetRegisterByAddress(0x0001);
+                        _modbusClient!.WriteSingleRegister(RegEventTracker, 40);
+                        var evtItem = GetRegisterByAddress(RegEventTracker);
                         if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 40));
                         AppendActivity("Payment satisfied → Starting");
                     }
@@ -1009,12 +1074,12 @@ namespace ModbusSimV1
 
             try
             {
-                WriteUdint(0x0003, 0u);
-                var totalItem = GetRegisterByAddress(0x0003);
+                WriteUdint(RegTotalPriceToPay, 0u);
+                var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
                 if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, "0"));
 
-                _modbusClient!.WriteSingleRegister(0x0001, 50);
-                var evtItem = GetRegisterByAddress(0x0001);
+                _modbusClient!.WriteSingleRegister(RegEventTracker, 50);
+                var evtItem = GetRegisterByAddress(RegEventTracker);
                 if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 50));
                 AppendActivity("Starting complete → Cycling");
             }
@@ -1051,7 +1116,7 @@ namespace ModbusSimV1
             if (!shouldTick) return;
 
             ushort remaining;
-            var remainingItem = GetRegisterByAddress(0x0006);
+            var remainingItem = GetRegisterByAddress(RegRemainingTime);
             if (remainingItem?.LastValue is int lastValue)
             {
                 remaining = (ushort)lastValue;
@@ -1060,7 +1125,7 @@ namespace ModbusSimV1
             {
                 try
                 {
-                    remaining = ReadUInt16(0x0006);
+                    remaining = ReadUInt16(RegRemainingTime);
                     performedPoll = true;
                     if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
                 }
@@ -1076,7 +1141,7 @@ namespace ModbusSimV1
             ushort next = (ushort)(remaining - 1);
             try
             {
-                _modbusClient!.WriteSingleRegister(0x0006, next);
+                _modbusClient!.WriteSingleRegister(RegRemainingTime, next);
                 if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, next));
             }
             catch (Exception ex)
@@ -1089,8 +1154,8 @@ namespace ModbusSimV1
             {
                 try
                 {
-                    _modbusClient!.WriteSingleRegister(0x0001, 60);
-                    var evtItem = GetRegisterByAddress(0x0001);
+                    _modbusClient!.WriteSingleRegister(RegEventTracker, 60);
+                    var evtItem = GetRegisterByAddress(RegEventTracker);
                     if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 60));
                     AppendActivity("Cycle finished → Cycle Finished");
                     lock (_stateLock)
@@ -1113,8 +1178,8 @@ namespace ModbusSimV1
 
             try
             {
-                _modbusClient!.WriteSingleRegister(0x0001, 10);
-                var evtItem = GetRegisterByAddress(0x0001);
+                _modbusClient!.WriteSingleRegister(RegEventTracker, 10);
+                var evtItem = GetRegisterByAddress(RegEventTracker);
                 if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 10));
                 AppendActivity("Cycle finished timeout → Idle");
                 ResetRunRegistersToZero();
@@ -1153,9 +1218,9 @@ namespace ModbusSimV1
         {
             if (_suppressEventCombo) return; if (cmbEvent.SelectedItem is not string name) return;
             if (_eventMapByName == null || !_eventMapByName.TryGetValue(name, out int value)) return;
-            try { if (_modbusClient is { Connected: true }) { _modbusClient.WriteSingleRegister(0x0001, (ushort)value); AppendActivity($"Machine Event → {name} ({value})"); } }
+            try { if (_modbusClient is { Connected: true }) { _modbusClient.WriteSingleRegister(RegEventTracker, (ushort)value); AppendActivity($"Machine Event → {name} ({value})"); } }
             catch (Exception ex) { AppendActivity($"Machine Event write error: {ex.Message}"); }
-            var evtItem = _registerItems.FirstOrDefault(r => r.Address == 0x0001); if (evtItem != null) UpdateRegisterValueDisplay(evtItem, value);
+            var evtItem = _registerItems.FirstOrDefault(r => r.Address == RegEventTracker); if (evtItem != null) UpdateRegisterValueDisplay(evtItem, value);
         }
 
         private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
