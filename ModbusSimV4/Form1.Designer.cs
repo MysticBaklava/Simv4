@@ -43,7 +43,6 @@ namespace ModbusSimV1
             this.cmbPort = new System.Windows.Forms.ComboBox();
             this.lblPort = new System.Windows.Forms.Label();
             this.buttonPanel = new System.Windows.Forms.FlowLayoutPanel();
-            this.btnCyclicEnable = new System.Windows.Forms.Button();
             this.btnRead = new System.Windows.Forms.Button();
             this.btnWrite = new System.Windows.Forms.Button();
             this.grpSelectedRegister = new System.Windows.Forms.GroupBox();
@@ -57,6 +56,8 @@ namespace ModbusSimV1
             this.cmbEvent = new System.Windows.Forms.ComboBox();
             this.lblActivity = new System.Windows.Forms.Label();
             this.lstActivity = new System.Windows.Forms.ListBox();
+            this.lblRxTx = new System.Windows.Forms.Label();
+            this.lstRxTx = new System.Windows.Forms.ListBox();
             this.layoutRoot.SuspendLayout();
             this.leftLayout.SuspendLayout();
             this.headerPanel.SuspendLayout();
@@ -131,7 +132,7 @@ namespace ModbusSimV1
             this.lblTitle.Name = "lblTitle";
             this.lblTitle.Size = new System.Drawing.Size(226, 32);
             this.lblTitle.TabIndex = 0;
-            this.lblTitle.Text = "Modbus Simulator";
+            this.lblTitle.Text = "Vector Controller Modbus Simulator";
             // 
             // flowRegisters
             // 
@@ -158,16 +159,20 @@ namespace ModbusSimV1
             this.rightLayout.Controls.Add(this.grpAutomation, 0, 3);
             this.rightLayout.Controls.Add(this.lblActivity, 0, 4);
             this.rightLayout.Controls.Add(this.lstActivity, 0, 5);
+            this.rightLayout.Controls.Add(this.lblRxTx, 0, 6);
+            this.rightLayout.Controls.Add(this.lstRxTx, 0, 7);
             this.rightLayout.Dock = System.Windows.Forms.DockStyle.Fill;
             this.rightLayout.Location = new System.Drawing.Point(707, 3);
             this.rightLayout.Name = "rightLayout";
-            this.rightLayout.RowCount = 6;
+            this.rightLayout.RowCount = 8;
             this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle());
             this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle());
             this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle());
-            this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 50F));
+            this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 40F));
             this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle());
-            this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 50F));
+            this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 30F));
+            this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle());
+            this.rightLayout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 30F));
             this.rightLayout.Size = new System.Drawing.Size(390, 837);
             this.rightLayout.TabIndex = 1;
             // 
@@ -256,7 +261,6 @@ namespace ModbusSimV1
             // 
             this.buttonPanel.AutoSize = true;
             this.buttonPanel.AutoSizeMode = System.Windows.Forms.AutoSizeMode.GrowAndShrink;
-            this.buttonPanel.Controls.Add(this.btnCyclicEnable);
             this.buttonPanel.Controls.Add(this.btnRead);
             this.buttonPanel.Controls.Add(this.btnWrite);
             this.buttonPanel.Dock = System.Windows.Forms.DockStyle.Fill;
@@ -267,37 +271,24 @@ namespace ModbusSimV1
             this.buttonPanel.TabIndex = 1;
             this.buttonPanel.WrapContents = false;
             // 
-            // btnCyclicEnable
-            // 
-            this.btnCyclicEnable.Enabled = false;
-            this.btnCyclicEnable.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.btnCyclicEnable.Location = new System.Drawing.Point(3, 3);
-            this.btnCyclicEnable.Margin = new System.Windows.Forms.Padding(3, 3, 3, 10);
-            this.btnCyclicEnable.Name = "btnCyclicEnable";
-            this.btnCyclicEnable.Size = new System.Drawing.Size(225, 40);
-            this.btnCyclicEnable.TabIndex = 0;
-            this.btnCyclicEnable.Text = "CYCLIC ENABLE";
-            this.btnCyclicEnable.UseVisualStyleBackColor = true;
-            this.btnCyclicEnable.Click += new System.EventHandler(this.btnCyclicEnable_Click);
-            // 
             // btnRead
-            // 
+            //
             this.btnRead.Enabled = false;
             this.btnRead.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.btnRead.Location = new System.Drawing.Point(3, 53);
-            this.btnRead.Margin = new System.Windows.Forms.Padding(3, 0, 3, 10);
+            this.btnRead.Location = new System.Drawing.Point(3, 3);
+            this.btnRead.Margin = new System.Windows.Forms.Padding(3, 3, 3, 10);
             this.btnRead.Name = "btnRead";
             this.btnRead.Size = new System.Drawing.Size(225, 40);
             this.btnRead.TabIndex = 1;
             this.btnRead.Text = "READ ONCE";
             this.btnRead.UseVisualStyleBackColor = true;
             this.btnRead.Click += new System.EventHandler(this.btnRead_Click);
-            // 
+            //
             // btnWrite
-            // 
+            //
             this.btnWrite.Enabled = false;
             this.btnWrite.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.btnWrite.Location = new System.Drawing.Point(3, 103);
+            this.btnWrite.Location = new System.Drawing.Point(3, 53);
             this.btnWrite.Margin = new System.Windows.Forms.Padding(3, 0, 3, 10);
             this.btnWrite.Name = "btnWrite";
             this.btnWrite.Size = new System.Drawing.Size(225, 40);
@@ -435,18 +426,44 @@ namespace ModbusSimV1
             this.lblActivity.Size = new System.Drawing.Size(94, 19);
             this.lblActivity.TabIndex = 4;
             this.lblActivity.Text = "Activity Log";
-            // 
+            //
             // lstActivity
-            // 
+            //
             this.lstActivity.Dock = System.Windows.Forms.DockStyle.Fill;
             this.lstActivity.Font = new System.Drawing.Font("Segoe UI", 9.75F);
             this.lstActivity.FormattingEnabled = true;
+            this.lstActivity.IntegralHeight = false;
             this.lstActivity.ItemHeight = 17;
             this.lstActivity.Location = new System.Drawing.Point(3, 675);
             this.lstActivity.Name = "lstActivity";
-            this.lstActivity.Size = new System.Drawing.Size(384, 159);
+            this.lstActivity.Size = new System.Drawing.Size(384, 83);
             this.lstActivity.TabIndex = 5;
             this.lstActivity.SelectedIndexChanged += new System.EventHandler(this.lstActivity_SelectedIndexChanged);
+            //
+            // lblRxTx
+            //
+            this.lblRxTx.AutoSize = true;
+            this.lblRxTx.Font = new System.Drawing.Font("Segoe UI", 10.5F, System.Drawing.FontStyle.Bold);
+            this.lblRxTx.Location = new System.Drawing.Point(3, 761);
+            this.lblRxTx.Margin = new System.Windows.Forms.Padding(3, 6, 3, 0);
+            this.lblRxTx.Name = "lblRxTx";
+            this.lblRxTx.Size = new System.Drawing.Size(99, 19);
+            this.lblRxTx.TabIndex = 6;
+            this.lblRxTx.Text = "RX/TX Log (hex)";
+            //
+            // lstRxTx
+            //
+            this.lstRxTx.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.lstRxTx.Font = new System.Drawing.Font("Consolas", 9.75F);
+            this.lstRxTx.FormattingEnabled = true;
+            this.lstRxTx.IntegralHeight = false;
+            this.lstRxTx.HorizontalScrollbar = true;
+            this.lstRxTx.ItemHeight = 15;
+            this.lstRxTx.Location = new System.Drawing.Point(3, 783);
+            this.lstRxTx.Name = "lstRxTx";
+            this.lstRxTx.Size = new System.Drawing.Size(384, 51);
+            this.lstRxTx.TabIndex = 7;
+            this.lstRxTx.SelectedIndexChanged += new System.EventHandler(this.lstRxTx_SelectedIndexChanged);
             // 
             // Form1
             // 
@@ -460,7 +477,7 @@ namespace ModbusSimV1
             this.MaximizeBox = false;
             this.Name = "Form1";
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
-            this.Text = "Modbus Simulator";
+            this.Text = "Vector Controller Modbus Simulator";
             this.Load += new System.EventHandler(this.Form1_Load);
             this.layoutRoot.ResumeLayout(false);
             this.leftLayout.ResumeLayout(false);
@@ -492,7 +509,6 @@ namespace ModbusSimV1
         private System.Windows.Forms.Button btnRefreshPorts;
         private System.Windows.Forms.ComboBox cmbPort;
         private System.Windows.Forms.Label lblPort;
-        private System.Windows.Forms.Button btnCyclicEnable;
         private System.Windows.Forms.Button btnRead;
         private System.Windows.Forms.Button btnWrite;
         private System.Windows.Forms.Label lblSelectedRegisterName;
@@ -501,6 +517,8 @@ namespace ModbusSimV1
         private System.Windows.Forms.CheckBox chkAutomationEnabled;
         private System.Windows.Forms.Label lblActivity;
         private System.Windows.Forms.ListBox lstActivity;
+        private System.Windows.Forms.Label lblRxTx;
+        private System.Windows.Forms.ListBox lstRxTx;
         private System.Windows.Forms.TableLayoutPanel layoutRoot;
         private System.Windows.Forms.TableLayoutPanel leftLayout;
         private System.Windows.Forms.Panel headerPanel;

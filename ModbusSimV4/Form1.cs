@@ -4,6 +4,8 @@ using System.ComponentModel;
 using System.Drawing;
 using System.IO.Ports;
 using System.Linq;
+using System.Reflection;
+using System.Threading;
 using System.Windows.Forms;
 using EasyModbus;
 
@@ -11,16 +13,64 @@ namespace ModbusSimV1
 {
     public partial class Form1 : Form
     {
+        // Backing store for the register cards on the UI – we drive these collections from
+        // the automation routines and the incoming Modbus traffic, so keep them readily accessible.
         private readonly BindingList<RegisterItem> _registerItems = new();
         private readonly Dictionary<int, RegisterDisplay> _registerDisplays = new();
+
+        // Single timer that powers both manual cyclic polling and automation-driven flows.
         private readonly System.Windows.Forms.Timer _pollTimer;
+        private const int PollTimerIntervalMs = 1000;
+
+        // Active Modbus client and connection bookkeeping state.
         private ModbusClient? _modbusClient;
         private string? _connectedPortName;
+
+        // Selection + polling state shared across various helpers.
         private RegisterItem? _selectedRegister;
         private bool _isPolling;
+        private readonly object _stateLock = new();
+        private readonly Dictionary<int, DateTime> _lastPollByEvent = new();
+        private int? _automationLastProcessedEvent;
+
+        // Centralised register map – keeping all addresses in one place makes future table updates
+        // significantly less error-prone than sprinkling literals throughout the file.
+        private const int RegVersionNumber = 0x0000;
+        private const int RegControllerStatus = 0x0001;
+        private const int RegEventTracker = 0x0002;
+        private const int RegPollCounter = 0x0003;
+        private const int RegTotalPriceToPay = 0x0004;
+        private const int RegSelectedProgramNumber = 0x0006;
+        private const int RegRemainingTime = 0x0007;
+        private const int RegPaymentSystemStatus = 0x000C;
+        private const int RegPaidAmount = 0x000D;
+        private const int RegDiscountAmount = 0x000F;
+        private const int RegCurrency = 0x0015;
+        private const int RegProgramPriceStart = 0x0016;   // Program Price 1 (UDINT, two words)
+        private const int RegProgramPriceEnd = 0x003C;     // Program Price 20 (UDINT, two words)
+        private const int RegExtraRinseModifier = 0x003E;
+        private const int RegExtraSoapModifier = 0x0040;
+        private const int RegExtraPrewashModifier = 0x0042;
+        private const int RegReservedEnd = 0x0046;         // Last reserved slot from the provided table
+
+        // Program price synchronisation sweeps the entire payment table anytime the slave raises the
+        // “Program Price Update Available” bit.  Capture the span once so every caller uses the same
+        // boundaries.
+        private const int RegPriceTablePollStart = RegPaymentSystemStatus;
+        private const int RegPriceTablePollEnd = RegReservedEnd;
+
+        // Helpers for word/byte conversions and bounded RX/TX log storage.
         private const bool SWAP_WORDS = true;
+        private const int RxTxLogCapacity = 500;
+        private static readonly PropertyInfo? SendDataProperty = typeof(ModbusClient).GetProperty("SendData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly PropertyInfo? ReceiveDataProperty = typeof(ModbusClient).GetProperty("ReceiveData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly FieldInfo? SendDataField = typeof(ModbusClient).GetField("sendData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly FieldInfo? ReceiveDataField = typeof(ModbusClient).GetField("receiveData", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private int _rxTxSequence;
 
         // ===== Event dropdown on the right panel =====
+        // Primary translation map for the Event Tracker register.  This drives both the
+        // combo box labels and the automation state machine below.
         private readonly Dictionary<int, string> _eventMapByValue = new()
         {
             {10, "Idle"},
@@ -35,21 +85,26 @@ namespace ModbusSimV1
         private Dictionary<string, int>? _eventMapByName;
         private bool _suppressEventCombo = false;
         private int? _lastEventTrackerValue = null;
-        private readonly int _defaultPollMs = 1500;
-        private readonly int _idlePollMs = 60000;
+
+        // Default poll cadence for the background timer.  Individual states stretch/shorten it.
+        // Single RNG instance that feeds the automation's pseudo-random payment/program picks.
         private readonly Random _rng = new Random();
+
+        // Timestamp bookkeeping for automation throttling and state transitions.
+        private DateTime _startingEnteredAt = DateTime.MinValue;
+        private DateTime _cyclingLastTick = DateTime.MinValue;
+        private DateTime _cycleFinishedEnteredAt = DateTime.MinValue;
+        private DateTime _lastManualPoll = DateTime.MinValue;
 
         public Form1()
         {
             InitializeComponent();
 
             // after InitializeComponent();
-            _cmbMachineEvent = cmbEvent;
             cmbEvent.Items.AddRange(_eventMapByValue.Values.ToArray());
-            cmbEvent.SelectedIndexChanged += CmbMachineEvent_SelectedIndexChanged;
 
             // default selection (sync to current Event Tracker if present)
-            var evt = GetRegisterByAddress(0x0001);
+            var evt = GetRegisterByAddress(RegEventTracker);
             int initVal = evt?.LastValue ?? 10;
             if (_eventMapByValue.TryGetValue(initVal, out var initLabel))
                 cmbEvent.SelectedItem = initLabel;
@@ -68,6 +123,7 @@ namespace ModbusSimV1
             grpAutomation.Text = "Automation";
             chkAutomationEnabled.Text = "Run automation";
             lblActivity.Text = "Activity Log";
+            lblRxTx.Text = "RX/TX Log (hex)";
 
             // Build Event dropdown in the automation box (designer must have cmbEvent + lblEvent)
             _eventMapByName = _eventMapByValue.ToDictionary(kv => kv.Value, kv => kv.Key);
@@ -77,10 +133,12 @@ namespace ModbusSimV1
             cmbEvent.SelectedItem = "Idle";
             cmbEvent.SelectedIndexChanged += CmbEvent_SelectedIndexChanged;
 
-            _pollTimer = new System.Windows.Forms.Timer { Interval = _defaultPollMs };
+            _pollTimer = new System.Windows.Forms.Timer { Interval = PollTimerIntervalMs };
             _pollTimer.Tick += PollTimer_Tick;
 
             flowRegisters.Resize += FlowRegisters_Resize;
+
+            _lastEventTrackerValue = 10;
         }
 
         private void Form1_Load(object? sender, EventArgs e)
@@ -112,40 +170,40 @@ namespace ModbusSimV1
             _registerItems.Clear();
             var items = new List<RegisterItem>
             {
-                new RegisterItem { Name = "Controller Status", Address = 0x0000, ChangeableBy = "MASTER", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update OK, Bit1=Overpayment Enabled", Description = "Vector Controller Status" },
-                new RegisterItem { Name = "Event Tracker", Address = 0x0001, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Changes depending on the machine page." },
-                new RegisterItem { Name = "Poll Counter", Address = 0x0002, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Increased by 1 every poll" },
-                new RegisterItem { Name = "Total Price To Pay", Address = 0x0003, ChangeableBy = "MASTER", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Selected program due amount." },
-                new RegisterItem { Name = "Selected Program No", Address = 0x0005, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 255", Description = "Selected program number by customer" },
-                new RegisterItem { Name = "Remaining Time (Min.)", Address = 0x0006, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 9999", Description = "Current cycle remaining time" },
-                new RegisterItem { Name = "Payment System Status", Address = 0x000B, ChangeableBy = "SLAVE", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update, Bit1=Discount, Bit2=System Update", Description = "Payment system status bits." },
-                new RegisterItem { Name = "Paid Amount", Address = 0x000C, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Total paid amount in current txn." },
-                new RegisterItem { Name = "Discount Amount", Address = 0x000E, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Applied discount." },
-                new RegisterItem { Name = "Currency", Address = 0x0014, ChangeableBy = "SLAVE", Type = "UINT", Size = "1", ValueRange = "0-5", Description = "0=None 1=Token 2=USD 3=TL 4=EUR 5=GBP" },
-                // 0x0015..0x0041 prices/modifiers — keep as in your file
-                new RegisterItem { Name = "Program 1 Price", Address = 0x0015, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 1 Price" },
-                new RegisterItem { Name = "Program 2 Price", Address = 0x0017, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 2 Price" },
-                new RegisterItem { Name = "Program 3 Price", Address = 0x0019, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 3 Price" },
-                new RegisterItem { Name = "Program 4 Price", Address = 0x001B, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 4 Price" },
-                new RegisterItem { Name = "Program 5 Price", Address = 0x001D, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 5 Price" },
-                new RegisterItem { Name = "Program 6 Price", Address = 0x001F, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 6 Price" },
-                new RegisterItem { Name = "Program 7 Price", Address = 0x0021, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 7 Price" },
-                new RegisterItem { Name = "Program 8 Price", Address = 0x0023, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 8 Price" },
-                new RegisterItem { Name = "Program 9 Price", Address = 0x0025, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 9 Price" },
-                new RegisterItem { Name = "Program 10 Price", Address = 0x0027, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 10 Price" },
-                new RegisterItem { Name = "Program 11 Price", Address = 0x0029, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 11 Price" },
-                new RegisterItem { Name = "Program 12 Price", Address = 0x002B, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 12 Price" },
-                new RegisterItem { Name = "Program 13 Price", Address = 0x002D, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 13 Price" },
-                new RegisterItem { Name = "Program 14 Price", Address = 0x002F, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 14 Price" },
-                new RegisterItem { Name = "Program 15 Price", Address = 0x0031, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 15 Price" },
-                new RegisterItem { Name = "Program 16 Price", Address = 0x0033, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 16 Price" },
-                new RegisterItem { Name = "Program 17 Price", Address = 0x0035, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 17 Price" },
-                new RegisterItem { Name = "Program 18 Price", Address = 0x0037, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 18 Price" },
-                new RegisterItem { Name = "Program 19 Price", Address = 0x0039, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 19 Price" },
-                new RegisterItem { Name = "Program 20 Price", Address = 0x003B, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 20 Price" },
-                new RegisterItem { Name = "Extra Rinse Modifier", Address = 0x003D, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Rinse Modifier" },
-                new RegisterItem { Name = "Extra Soap Modifier", Address = 0x003F, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Soap Modifier" },
-                new RegisterItem { Name = "Extra Prewash Modifier", Address = 0x0041, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Prewash Modifier" },
+                new RegisterItem { Name = "Version Number", Address = RegVersionNumber, ChangeableBy = "SLAVE", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Simulator software version.", LastValue = 1 },
+                new RegisterItem { Name = "Controller Status", Address = RegControllerStatus, ChangeableBy = "MASTER", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update OK, Bit1=Overpayment Enabled", Description = "Vector Controller Status" },
+                new RegisterItem { Name = "Event Tracker", Address = RegEventTracker, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Changes depending on the machine page." },
+                new RegisterItem { Name = "Poll Counter", Address = RegPollCounter, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 65535", Description = "Increased by 1 every poll" },
+                new RegisterItem { Name = "Total Price To Pay", Address = RegTotalPriceToPay, ChangeableBy = "MASTER", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Selected program due amount." },
+                new RegisterItem { Name = "Selected Program No", Address = RegSelectedProgramNumber, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 255", Description = "Selected program number by customer" },
+                new RegisterItem { Name = "Remaining Time (Min.)", Address = RegRemainingTime, ChangeableBy = "MASTER", Type = "UINT", Size = "1", ValueRange = "0 - 9999", Description = "Current cycle remaining time" },
+                new RegisterItem { Name = "Payment System Status", Address = RegPaymentSystemStatus, ChangeableBy = "SLAVE", Type = "BITFIELD", Size = "1", ValueRange = "Bit0=Price Update, Bit1=Discount, Bit2=System Update", Description = "Payment system status bits." },
+                new RegisterItem { Name = "Paid Amount", Address = RegPaidAmount, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Total paid amount in current txn." },
+                new RegisterItem { Name = "Discount Amount", Address = RegDiscountAmount, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "0.00 - 999.99", Description = "Applied discount." },
+                new RegisterItem { Name = "Currency", Address = RegCurrency, ChangeableBy = "SLAVE", Type = "UINT", Size = "1", ValueRange = "0-5", Description = "0=None 1=Token 2=USD 3=TL 4=EUR 5=GBP" },
+                new RegisterItem { Name = "Program 1 Price", Address = RegProgramPriceStart + 0, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 1 Price" },
+                new RegisterItem { Name = "Program 2 Price", Address = RegProgramPriceStart + 0x0002, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 2 Price" },
+                new RegisterItem { Name = "Program 3 Price", Address = RegProgramPriceStart + 0x0004, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 3 Price" },
+                new RegisterItem { Name = "Program 4 Price", Address = RegProgramPriceStart + 0x0006, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 4 Price" },
+                new RegisterItem { Name = "Program 5 Price", Address = RegProgramPriceStart + 0x0008, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 5 Price" },
+                new RegisterItem { Name = "Program 6 Price", Address = RegProgramPriceStart + 0x000A, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 6 Price" },
+                new RegisterItem { Name = "Program 7 Price", Address = RegProgramPriceStart + 0x000C, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 7 Price" },
+                new RegisterItem { Name = "Program 8 Price", Address = RegProgramPriceStart + 0x000E, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 8 Price" },
+                new RegisterItem { Name = "Program 9 Price", Address = RegProgramPriceStart + 0x0010, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 9 Price" },
+                new RegisterItem { Name = "Program 10 Price", Address = RegProgramPriceStart + 0x0012, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 10 Price" },
+                new RegisterItem { Name = "Program 11 Price", Address = RegProgramPriceStart + 0x0014, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 11 Price" },
+                new RegisterItem { Name = "Program 12 Price", Address = RegProgramPriceStart + 0x0016, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 12 Price" },
+                new RegisterItem { Name = "Program 13 Price", Address = RegProgramPriceStart + 0x0018, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 13 Price" },
+                new RegisterItem { Name = "Program 14 Price", Address = RegProgramPriceStart + 0x001A, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 14 Price" },
+                new RegisterItem { Name = "Program 15 Price", Address = RegProgramPriceStart + 0x001C, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 15 Price" },
+                new RegisterItem { Name = "Program 16 Price", Address = RegProgramPriceStart + 0x001E, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 16 Price" },
+                new RegisterItem { Name = "Program 17 Price", Address = RegProgramPriceStart + 0x0020, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 17 Price" },
+                new RegisterItem { Name = "Program 18 Price", Address = RegProgramPriceStart + 0x0022, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 18 Price" },
+                new RegisterItem { Name = "Program 19 Price", Address = RegProgramPriceStart + 0x0024, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 19 Price" },
+                new RegisterItem { Name = "Program 20 Price", Address = RegProgramPriceEnd, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Program 20 Price" },
+                new RegisterItem { Name = "Extra Rinse Modifier", Address = RegExtraRinseModifier, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Rinse Modifier" },
+                new RegisterItem { Name = "Extra Soap Modifier", Address = RegExtraSoapModifier, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Soap Modifier" },
+                new RegisterItem { Name = "Extra Prewash Modifier", Address = RegExtraPrewashModifier, ChangeableBy = "SLAVE", Type = "UDINT", Size = "2", ValueRange = "1-999999(9999,99)", Description = "Extra Prewash Modifier" },
             };
             foreach (var it in items)
                 if (string.Equals(it.Type, "UDINT", StringComparison.OrdinalIgnoreCase)) it.WordLength = 2;
@@ -301,9 +359,13 @@ namespace ModbusSimV1
             {
                 DisconnectInternal();
                 _modbusClient = new ModbusClient(portName) { Baudrate = 9600, Parity = Parity.Even, StopBits = StopBits.One, UnitIdentifier = 1 };
+                AttachClientEvents(_modbusClient);
                 _modbusClient.Connect();
                 _connectedPortName = portName;
+                ResetRxTxLog();
                 AppendActivity($"{portName} Connected");
+                EnsurePollingTimerRunning();
+                SeedVersionRegister();
             }
             catch (Exception ex)
             { AppendActivity($"Connection Error: {ex.Message}"); MessageBox.Show($"Could not connect: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); DisconnectInternal(); }
@@ -314,20 +376,33 @@ namespace ModbusSimV1
 
         private void DisconnectInternal()
         {
-            StopCyclicPolling();
-            if (_modbusClient is { Connected: true })
+            StopPollingTimer();
+            if (_modbusClient is { } existing)
             {
-                try { _modbusClient.Disconnect(); AppendActivity("Disconnected."); }
-                catch (Exception ex) { AppendActivity($"Disconnect error: {ex.Message}"); }
+                DetachClientEvents(existing);
+                if (existing.Connected)
+                {
+                    try { existing.Disconnect(); AppendActivity("Disconnected."); }
+                    catch (Exception ex) { AppendActivity($"Disconnect error: {ex.Message}"); }
+                }
             }
             _modbusClient = null; _connectedPortName = null;
+            lock (_stateLock)
+            {
+                _lastPollByEvent.Clear();
+                _automationLastProcessedEvent = null;
+                _startingEnteredAt = DateTime.MinValue;
+                _cyclingLastTick = DateTime.MinValue;
+                _cycleFinishedEnteredAt = DateTime.MinValue;
+                _lastManualPoll = DateTime.MinValue;
+                _lastEventTrackerValue = 10;
+            }
         }
 
         private void UpdateConnectionState()
         {
             bool connected = _modbusClient?.Connected ?? false;
             btnConnect.Enabled = !connected; btnDisconnect.Enabled = connected; btnRefreshPorts.Enabled = !connected; cmbPort.Enabled = !connected;
-            btnCyclicEnable.Enabled = connected; btnCyclicEnable.Text = _pollTimer.Enabled ? "STOP CYCLIC" : "CYCLIC ENABLE";
             btnRead.Enabled = connected && _selectedRegister is not null; btnWrite.Enabled = connected && _selectedRegister?.IsWritable == true;
             lblConnectionStatus.Text = connected ? $"Status: {_connectedPortName ?? "Connected"}" : "Status: Disconnected";
             if (_selectedRegister is RegisterItem sel && _registerDisplays.TryGetValue(sel.Address, out var d))
@@ -389,15 +464,26 @@ namespace ModbusSimV1
             catch (Exception ex) { AppendActivity($"Read error ({item.Name}): {ex.Message}"); if (showErrors) MessageBox.Show($"Read failed: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         }
 
+        private RegisterItem? GetRegisterByAddress(int address)
+        {
+            if (_registerDisplays.TryGetValue(address, out var display))
+            {
+                return display.Item;
+            }
+
+            return _registerItems.FirstOrDefault(r => r.Address == address);
+        }
+
         private void UpdateRegisterValueDisplay(RegisterItem item, int value)
         {
             item.LastValue = value;
-            if (item.Address == 0x0001) // Event Tracker -> sync combo
+            if (item.Address == RegEventTracker) // Event Tracker -> sync combo
             {
                 if (_eventMapByValue.TryGetValue(value, out var label))
                 {
                     Ui(() => { _suppressEventCombo = true; if (!Equals(cmbEvent.SelectedItem, label)) cmbEvent.SelectedItem = label; _suppressEventCombo = false; });
                 }
+                OnEventTrackerValueObserved(value);
             }
             if (_registerDisplays.TryGetValue(item.Address, out var display))
             {
@@ -409,14 +495,26 @@ namespace ModbusSimV1
             item.LastValue = null; if (_registerDisplays.TryGetValue(item.Address, out var display)) if (!string.Equals(display.ValueBox.Text, text, StringComparison.Ordinal)) Ui(() => display.ValueBox.Text = text);
         }
 
-        private void btnCyclicEnable_Click(object? sender, EventArgs e)
-        { if (!EnsureConnected()) return; if (_pollTimer.Enabled) { StopCyclicPolling(true); } else { _pollTimer.Start(); AppendActivity("Cyclic started."); } UpdateConnectionState(); }
-        private void StopCyclicPolling(bool log = false) { if (_pollTimer.Enabled) { _pollTimer.Stop(); if (log) AppendActivity("Cyclic stopped."); } }
-
         private void PollTimer_Tick(object? sender, EventArgs e)
         {
             if (_isPolling) return; _isPolling = true;
             System.Threading.Tasks.Task.Run(() => { try { lock (_pollLock) { CyclicStep(); } } finally { _isPolling = false; } });
+        }
+
+        private void EnsurePollingTimerRunning()
+        {
+            if (!_pollTimer.Enabled)
+            {
+                _pollTimer.Start();
+            }
+        }
+
+        private void StopPollingTimer()
+        {
+            if (_pollTimer.Enabled)
+            {
+                _pollTimer.Stop();
+            }
         }
 
         // ===== CYCLIC / AUTOMATION =====
@@ -426,11 +524,11 @@ namespace ModbusSimV1
 
         private List<RegisterItem> GetItemsInRange(int startAddr, int endAddr) => _registerItems.Where(it => it.Address >= startAddr && it.Address <= endAddr).OrderBy(it => it.Address).ToList();
 
-        private Dictionary<int, int> BulkReadRangeUpdate(List<RegisterItem> items)
+        private Dictionary<int, int> BulkReadRangeUpdate(List<RegisterItem> items, ref bool polled)
         {
             var result = new Dictionary<int, int>(); if (items.Count == 0 || !EnsureConnected(false)) return result;
             int start = items.Min(it => it.Address); int maxEnd = items.Max(it => it.Address + it.WordLength); int totalWords = maxEnd - start; if (totalWords <= 0) return result;
-            int[] all; try { all = _modbusClient!.ReadHoldingRegisters(start, totalWords); } catch { Ui(() => StopCyclicPolling()); return result; }
+            int[] all; try { all = _modbusClient!.ReadHoldingRegisters(start, totalWords); polled = true; } catch { Ui(() => StopPollingTimer()); return result; }
             foreach (var item in items)
             {
                 int offset = item.Address - start; if (offset < 0 || offset >= all.Length) continue;
@@ -443,14 +541,22 @@ namespace ModbusSimV1
         }
 
         private void WriteUdint(int addr, uint value) => _modbusClient!.WriteMultipleRegisters(addr, SplitUInt32ToWords(value));
-        private uint ReadUdint(int addr) { var v = _modbusClient!.ReadHoldingRegisters(addr, 2); return CombineToUInt32(v[0], v[1]); }
-        private void SetPollInterval(int ms) => Ui(() => { if (_pollTimer.Interval != ms) _pollTimer.Interval = ms; });
-
+        private ushort ReadUInt16(int addr)
+        {
+            var words = _modbusClient!.ReadHoldingRegisters(addr, 1);
+            return words.Length > 0 ? (ushort)words[0] : (ushort)0;
+        }
+        private uint ReadUdint(int addr)
+        {
+            var v = _modbusClient!.ReadHoldingRegisters(addr, 2);
+            return CombineToUInt32(v[0], v[1]);
+        }
         private void WriteMasterRange0to6()
         {
-            if (!EnsureConnected(false)) return; var items = GetItemsInRange(0x0000, 0x0006).Where(i => i.IsWritable).ToList();
+            if (!EnsureConnected(false)) return; var items = GetItemsInRange(RegVersionNumber, RegRemainingTime).Where(i => i.IsWritable).ToList();
             foreach (var item in items)
             {
+                if (item.Address == RegPollCounter) continue; // poll counter handled separately
                 if (!_registerDisplays.TryGetValue(item.Address, out var disp)) continue;
                 try
                 {
@@ -458,8 +564,7 @@ namespace ModbusSimV1
                     { string text = UiGet(() => disp.ValueBox.Text); if (!ulong.TryParse(text, out var ul) || ul > uint.MaxValue) continue; uint u32 = (uint)ul; WriteUdint(item.Address, u32); Ui(() => UpdateRegisterValueDisplay(item, u32.ToString())); }
                     else
                     {
-                        ushort value; if (item.Address == 0x0002) { string cur = UiGet(() => disp.ValueBox.Text); if (!ushort.TryParse(cur, out value)) value = 0; value = (ushort)((value + 1) & 0xFFFF); }
-                        else { string text = UiGet(() => disp.ValueBox.Text); if (!ushort.TryParse(text, out value)) continue; }
+                        string text = UiGet(() => disp.ValueBox.Text); if (!ushort.TryParse(text, out ushort value)) continue;
                         _modbusClient!.WriteSingleRegister(item.Address, value); Ui(() => UpdateRegisterValueDisplay(item, value));
                     }
                 }
@@ -467,83 +572,614 @@ namespace ModbusSimV1
             }
         }
 
-        private void CyclicStep()
+        private void SeedVersionRegister()
         {
-            if (!EnsureConnected(false)) { Ui(() => StopCyclicPolling()); return; }
-
-            if (!UiGet(() => chkAutomationEnabled.Checked))
+            if (!EnsureConnected(false)) return;
+            try
             {
-                WriteMasterRange0to6();
-                var mapA = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E));
-                bool priceUpdate = mapA.TryGetValue(0x000B, out int st) && ((st & 0x0001) != 0);
-                if (priceUpdate) BulkReadRangeUpdate(GetItemsInRange(0x0014, 0x0041));
-                SetPollInterval(_defaultPollMs);
+                _modbusClient!.WriteSingleRegister(RegVersionNumber, 1);
+                var versionItem = GetRegisterByAddress(RegVersionNumber);
+                if (versionItem != null) Ui(() => UpdateRegisterValueDisplay(versionItem, 1));
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to seed version register: {ex.Message}");
+            }
+        }
+
+        // Ensure the master-writable run registers (total/program/time) are reset to zero.
+        // We invoke this whenever an automation state requires a clean slate before continuing.
+        private void ResetRunRegistersToZero()
+        {
+            try
+            {
+                bool totalNeedsZero = true;
+                if (_registerDisplays.TryGetValue(RegTotalPriceToPay, out var totalDisplay))
+                {
+                    string text = UiGet(() => totalDisplay.ValueBox.Text);
+                    totalNeedsZero = !string.Equals(text, "0", StringComparison.Ordinal);
+                }
+
+                bool programNeedsZero = true;
+                if (_registerDisplays.TryGetValue(RegSelectedProgramNumber, out var programDisplay))
+                {
+                    string text = UiGet(() => programDisplay.ValueBox.Text);
+                    programNeedsZero = !string.Equals(text, "0", StringComparison.Ordinal);
+                }
+
+                bool remainingNeedsZero = true;
+                if (_registerDisplays.TryGetValue(RegRemainingTime, out var remainingDisplay))
+                {
+                    string text = UiGet(() => remainingDisplay.ValueBox.Text);
+                    remainingNeedsZero = !string.Equals(text, "0", StringComparison.Ordinal);
+                }
+
+                if (totalNeedsZero)
+                {
+                    WriteUdint(RegTotalPriceToPay, 0u);
+                    var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
+                    if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, "0"));
+                }
+
+                if (programNeedsZero)
+                {
+                    _modbusClient!.WriteSingleRegister(RegSelectedProgramNumber, 0);
+                    var programItem = GetRegisterByAddress(RegSelectedProgramNumber);
+                    if (programItem != null) Ui(() => UpdateRegisterValueDisplay(programItem, 0));
+                }
+
+                if (remainingNeedsZero)
+                {
+                    _modbusClient!.WriteSingleRegister(RegRemainingTime, 0);
+                    var remainingItem = GetRegisterByAddress(RegRemainingTime);
+                    if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, 0));
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to zero master registers: {ex.Message}");
+            }
+        }
+
+        // The payment system raises bit0 of the Payment System Status register to signal that
+        // updated program prices are available.  Callers can request a full sweep of the price table
+        // (0x000C–0x0046 in the new layout) while
+        // the flag is raised; regardless, we mirror the acknowledgement by forcing controller-
+        // status bit0 high.  Once the slave drops its availability flag we immediately clear our
+        // acknowledgement.
+        private void SynchronizeProgramPriceUpdate(ushort paymentStatus, bool pollFullRange, ref bool performedPoll)
+        {
+            bool priceUpdateAvailable = (paymentStatus & 0x0001) != 0;
+
+            if (priceUpdateAvailable)
+            {
+                if (pollFullRange)
+                {
+                    BulkReadRangeUpdate(GetItemsInRange(RegPriceTablePollStart, RegPriceTablePollEnd), ref performedPoll);
+                }
+
+                // Availability asserted → acknowledge by raising the controller's finished flag.
+                SetControllerStatusBit0(true, ref performedPoll);
+
+                // If the slave keeps the availability flag up for multiple scans we simply keep
+                // the acknowledgement high; the payment system will drop its flag once it has
+                // observed the controller bit and completed the update cycle.
                 return;
             }
 
-            // Automation ON — drive by Event Tracker
-            int curEvent;
-            try { var arr = _modbusClient!.ReadHoldingRegisters(0x0001, 1); curEvent = arr[0] & 0xFFFF; var evtItem = GetRegisterByAddress(0x0001); if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, curEvent)); }
-            catch { return; }
+            // Availability cleared → always mirror it by resetting the finished flag so the UI
+            // never shows the controller as done when the payment system has nothing pending.
+            SetControllerStatusBit0(false, ref performedPoll);
+        }
 
-            bool eventChanged = _lastEventTrackerValue != curEvent; _lastEventTrackerValue = curEvent;
+        // Convenience helper to raise/lower controller status bit0 while keeping the UI in sync
+        // and avoiding redundant writes if the bit is already in the desired state.
+        private void SetControllerStatusBit0(bool on, ref bool performedPoll)
+        {
+            ushort current;
+            var statusItem = GetRegisterByAddress(RegControllerStatus);
+            if (statusItem?.LastValue is int last)
+            {
+                current = (ushort)last;
+            }
+            else
+            {
+                try
+                {
+                    current = ReadUInt16(RegControllerStatus);
+                    performedPoll = true;
+                    if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, current));
+                }
+                catch (Exception ex)
+                {
+                    AppendActivity($"Failed to read controller status: {ex.Message}");
+                    return;
+                }
+            }
+
+            ushort desired = on ? (ushort)(current | 0x0001) : (ushort)(current & ~0x0001);
+            if (desired == current) return;
+
+            try
+            {
+                _modbusClient!.WriteSingleRegister(RegControllerStatus, desired);
+                if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, desired));
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to update controller status bit: {ex.Message}");
+            }
+        }
+
+        // Bump Poll Counter (0x0003) and mirror the value in the register card.  Only invoked
+        // after an actual Modbus read/write to stay faithful to the hardware behavior.
+        private void IncrementPollCounter()
+        {
+            try
+            {
+                ushort current = ReadUInt16(RegPollCounter);
+                ushort next = (ushort)((current + 1) & 0xFFFF);
+                _modbusClient!.WriteSingleRegister(RegPollCounter, next);
+                var pollItem = GetRegisterByAddress(RegPollCounter);
+                if (pollItem != null) Ui(() => UpdateRegisterValueDisplay(pollItem, next));
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Poll counter update failed: {ex.Message}");
+            }
+        }
+
+        private void CyclicStep()
+        {
+            if (!EnsureConnected(false)) { Ui(() => StopPollingTimer()); return; }
+
+            bool automationEnabled = UiGet(() => chkAutomationEnabled.Checked);
+            if (!automationEnabled)
+            {
+                HandleManualPolling();
+                return;
+            }
+
+            int curEvent;
+            int? lastProcessed;
+            DateTime lastPoll;
+            DateTime startingEnteredAt;
+            DateTime cycleFinishedEnteredAt;
+
+            lock (_stateLock)
+            {
+                curEvent = _lastEventTrackerValue ?? 10;
+                lastProcessed = _automationLastProcessedEvent;
+                if (!_lastPollByEvent.TryGetValue(curEvent, out lastPoll))
+                {
+                    lastPoll = DateTime.MinValue;
+                }
+                startingEnteredAt = _startingEnteredAt;
+                cycleFinishedEnteredAt = _cycleFinishedEnteredAt;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            bool eventChanged = lastProcessed != curEvent;
+
+            if (eventChanged)
+            {
+                lock (_stateLock)
+                {
+                    _automationLastProcessedEvent = curEvent;
+                    _lastPollByEvent[curEvent] = DateTime.MinValue;
+                    _startingEnteredAt = curEvent == 40 ? now : DateTime.MinValue;
+                    _cyclingLastTick = curEvent == 50 ? now : DateTime.MinValue;
+                    _cycleFinishedEnteredAt = curEvent == 60 ? now : DateTime.MinValue;
+                    startingEnteredAt = _startingEnteredAt;
+                    cycleFinishedEnteredAt = _cycleFinishedEnteredAt;
+                }
+                lastPoll = DateTime.MinValue;
+            }
+
+            TimeSpan pollInterval = GetPollIntervalForEvent(curEvent);
+            bool shouldPollNow = lastPoll == DateTime.MinValue || now - lastPoll >= pollInterval;
+
+            bool performedPoll = false;
 
             switch (curEvent)
             {
-                case 10: // Idle — poll every minute, read 11..14
-                    SetPollInterval(_idlePollMs); BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E)); break;
-                case 20: // Program Selection — zero 3..6 once
-                    SetPollInterval(_defaultPollMs);
+                case 10: // Idle
+                {
                     if (eventChanged)
                     {
-                        try
-                        {
-                            WriteUdint(0x0003, 0u); _modbusClient!.WriteSingleRegister(0x0005, 0); _modbusClient!.WriteSingleRegister(0x0006, 0);
-                            var r3 = GetRegisterByAddress(0x0003); if (r3 != null) Ui(() => UpdateRegisterValueDisplay(r3, "0"));
-                            var r5 = GetRegisterByAddress(0x0005); if (r5 != null) Ui(() => UpdateRegisterValueDisplay(r5, 0));
-                            var r6 = GetRegisterByAddress(0x0006); if (r6 != null) Ui(() => UpdateRegisterValueDisplay(r6, 0));
-                            AppendActivity("Program Selection: cleared regs 3..6.");
-                        }
-                        catch (Exception ex) { AppendActivity($"Program Selection write error: {ex.Message}"); }
+                        ResetRunRegistersToZero();
+                    }
+                    if (shouldPollNow && PollPaymentStatus("Idle", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
                     }
                     break;
-                case 21: // Extra Selection — no op
-                    SetPollInterval(_defaultPollMs); break;
-                case 30: // Payment — randomize once, read 11..14, then maybe switch to Starting
-                    SetPollInterval(_defaultPollMs);
+                }
+                case 20: // Program Selection
+                case 21: // Extra Selection
+                {
                     if (eventChanged)
                     {
-                        try
-                        {
-                            ushort program = (ushort)_rng.Next(1, 21);
-                            ushort remaining = (ushort)_rng.Next(1, 21);
-                            uint total = (uint)_rng.Next(10, 501);
-                            _modbusClient!.WriteSingleRegister(0x0005, program);
-                            _modbusClient!.WriteSingleRegister(0x0006, remaining);
-                            WriteUdint(0x0003, total);
-                            var r5 = GetRegisterByAddress(0x0005); if (r5 != null) Ui(() => UpdateRegisterValueDisplay(r5, program));
-                            var r6 = GetRegisterByAddress(0x0006); if (r6 != null) Ui(() => UpdateRegisterValueDisplay(r6, remaining));
-                            var r3 = GetRegisterByAddress(0x0003); if (r3 != null) Ui(() => UpdateRegisterValueDisplay(r3, total.ToString()));
-                            AppendActivity($"Payment: program={program}, remaining={remaining}, total={total}");
-                        }
-                        catch (Exception ex) { AppendActivity($"Payment randomization error: {ex.Message}"); }
+                        ResetRunRegistersToZero();
                     }
-                    var mapPay = BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E));
+                    if (shouldPollNow && PollPaymentStatus("Selection", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
+                    break;
+                }
+                case 30: // Payment
+                {
+                    if (eventChanged)
+                    {
+                        RandomizePaymentRegisters();
+                    }
+                    if (shouldPollNow && PollPaymentAndAdvance(ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
+                    break;
+                }
+                case 40: // Starting
+                {
+                    if (shouldPollNow && PollPaymentStatus("Starting", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
+                    HandleStartingTransition(now, startingEnteredAt);
+                    break;
+                }
+                case 50: // Cycling
+                {
+                    if (shouldPollNow && PollPaymentStatus("Cycling", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
+                    HandleCyclingCountdown(now, ref performedPoll);
+                    break;
+                }
+                case 60: // Cycle Finished
+                {
+                    if (shouldPollNow && PollPaymentStatus("Cycle Finished", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
+                    HandleCycleFinishedReturn(now, cycleFinishedEnteredAt);
+                    break;
+                }
+                case 999: // Machine Unavailable
+                {
+                    if (shouldPollNow && PollPaymentStatus("Machine Unavailable", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
+                    break;
+                }
+                default:
+                {
+                    if (shouldPollNow && PollPaymentStatus("Automation", pollFullRange: true, ref performedPoll))
+                    {
+                        MarkEventPoll(curEvent, now);
+                    }
+                    break;
+                }
+            }
+
+            if (performedPoll)
+            {
+                IncrementPollCounter();
+            }
+        }
+
+        private void HandleManualPolling()
+        {
+            DateTime now = DateTime.UtcNow;
+            if (now - _lastManualPoll < TimeSpan.FromSeconds(2)) return;
+
+            bool performedPoll = false;
+
+            WriteMasterRange0to6();
+            var map = BulkReadRangeUpdate(GetItemsInRange(RegPaymentSystemStatus, RegDiscountAmount), ref performedPoll);
+            if (map.TryGetValue(RegPaymentSystemStatus, out int statusValue))
+            {
+                SynchronizeProgramPriceUpdate((ushort)(statusValue & 0xFFFF), pollFullRange: true, ref performedPoll);
+            }
+
+            if (performedPoll)
+            {
+                IncrementPollCounter();
+            }
+
+            lock (_stateLock)
+            {
+                _lastManualPoll = now;
+            }
+        }
+
+        private void PrimeEventTrackerFromSlave()
+        {
+            if (_modbusClient is not { Connected: true }) return;
+
+            try
+            {
+                var arr = _modbusClient.ReadHoldingRegisters(RegEventTracker, 1);
+                if (arr.Length == 0) return;
+                int value = arr[0] & 0xFFFF;
+                var evtItem = GetRegisterByAddress(RegEventTracker);
+                if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, value));
+                IncrementPollCounter();
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Event tracker read failed: {ex.Message}");
+            }
+        }
+
+        private void MarkEventPoll(int eventValue, DateTime timestamp)
+        {
+            lock (_stateLock)
+            {
+                _lastPollByEvent[eventValue] = timestamp;
+            }
+        }
+
+        private TimeSpan GetPollIntervalForEvent(int eventValue) => eventValue switch
+        {
+            10 => TimeSpan.FromMinutes(1),
+            20 => TimeSpan.FromSeconds(5),
+            21 => TimeSpan.FromSeconds(5),
+            30 => TimeSpan.FromSeconds(2),
+            40 => TimeSpan.FromSeconds(5),
+            50 => TimeSpan.FromMinutes(1),
+            60 => TimeSpan.FromMinutes(1),
+            999 => TimeSpan.FromMinutes(1),
+            _ => TimeSpan.FromSeconds(5)
+        };
+
+        private bool PollPaymentStatus(string context, bool pollFullRange, ref bool performedPoll)
+        {
+            try
+            {
+                ushort status = ReadUInt16(RegPaymentSystemStatus);
+                performedPoll = true;
+                var statusItem = GetRegisterByAddress(RegPaymentSystemStatus);
+                if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, status));
+                SynchronizeProgramPriceUpdate(status, pollFullRange, ref performedPoll);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"{context} payment poll failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void RandomizePaymentRegisters()
+        {
+            try
+            {
+                uint total = (uint)_rng.Next(1, 100000);
+                ushort program = (ushort)_rng.Next(1, 21);
+                ushort remaining = (ushort)_rng.Next(5, 46);
+
+                WriteUdint(RegTotalPriceToPay, total);
+                _modbusClient!.WriteSingleRegister(RegSelectedProgramNumber, program);
+                _modbusClient!.WriteSingleRegister(RegRemainingTime, remaining);
+
+                var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
+                if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, total.ToString()));
+                var programItem = GetRegisterByAddress(RegSelectedProgramNumber);
+                if (programItem != null) Ui(() => UpdateRegisterValueDisplay(programItem, program));
+                var remainingItem = GetRegisterByAddress(RegRemainingTime);
+                if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
+
+                AppendActivity($"Payment randomised: total={total}, program={program}, remaining={remaining}");
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Payment randomisation failed: {ex.Message}");
+            }
+        }
+
+        private bool PollPaymentAndAdvance(ref bool performedPoll)
+        {
+            try
+            {
+                ushort paymentStatus = ReadUInt16(RegPaymentSystemStatus);
+                performedPoll = true;
+                var statusItem = GetRegisterByAddress(RegPaymentSystemStatus);
+                if (statusItem != null) Ui(() => UpdateRegisterValueDisplay(statusItem, paymentStatus));
+                SynchronizeProgramPriceUpdate(paymentStatus, pollFullRange: true, ref performedPoll);
+
+                uint paidAmount = ReadUdint(RegPaidAmount);
+                performedPoll = true;
+                var paidItem = GetRegisterByAddress(RegPaidAmount);
+                if (paidItem != null) Ui(() => UpdateRegisterValueDisplay(paidItem, paidAmount.ToString()));
+
+                uint discountAmount = ReadUdint(RegDiscountAmount);
+                performedPoll = true;
+                var discountItem = GetRegisterByAddress(RegDiscountAmount);
+                if (discountItem != null) Ui(() => UpdateRegisterValueDisplay(discountItem, discountAmount.ToString()));
+
+                uint totalToPay = ReadUdint(RegTotalPriceToPay);
+                performedPoll = true;
+                var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
+                if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, totalToPay.ToString()));
+
+                bool paymentReady = paidAmount >= totalToPay;
+                bool requireDiscountCheck = (paymentStatus & 0x0002) != 0 || (paymentStatus & 0x0004) != 0;
+                if (requireDiscountCheck)
+                {
+                    paymentReady = paidAmount + discountAmount >= totalToPay;
+                }
+
+                if (paymentReady)
+                {
                     try
                     {
-                        bool statusZero = mapPay.TryGetValue(0x000B, out int st2) && st2 == 0;
-                        uint paid = ReadUdint(0x000C); uint total = ReadUdint(0x0003);
-                        if (statusZero && paid >= total)
-                        {
-                            _modbusClient!.WriteSingleRegister(0x0001, 40); // Starting
-                            var evtItem = GetRegisterByAddress(0x0001); if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 40));
-                            _lastEventTrackerValue = 40; AppendActivity($"Payment OK (paid={paid} >= total={total}) → Starting");
-                        }
+                        _modbusClient!.WriteSingleRegister(RegEventTracker, 40);
+                        var evtItem = GetRegisterByAddress(RegEventTracker);
+                        if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 40));
+                        AppendActivity("Payment satisfied → Starting");
                     }
-                    catch (Exception ex) { AppendActivity($"Payment check error: {ex.Message}"); }
-                    break;
-                default: // Starting/Cycling/Cycle Finished/Machine Unavailable — light read
-                    SetPollInterval(_defaultPollMs); BulkReadRangeUpdate(GetItemsInRange(0x000B, 0x000E)); break;
+                    catch (Exception ex)
+                    {
+                        AppendActivity($"Failed to advance to Starting: {ex.Message}");
+                    }
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Payment polling failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void HandleStartingTransition(DateTime now, DateTime enteredAt)
+        {
+            if (enteredAt == DateTime.MinValue) return;
+            if (now - enteredAt < TimeSpan.FromSeconds(5)) return;
+
+            try
+            {
+                WriteUdint(RegTotalPriceToPay, 0u);
+                var totalItem = GetRegisterByAddress(RegTotalPriceToPay);
+                if (totalItem != null) Ui(() => UpdateRegisterValueDisplay(totalItem, "0"));
+
+                _modbusClient!.WriteSingleRegister(RegEventTracker, 50);
+                var evtItem = GetRegisterByAddress(RegEventTracker);
+                if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 50));
+                AppendActivity("Starting complete → Cycling");
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to advance to Cycling: {ex.Message}");
+                return;
+            }
+
+            lock (_stateLock)
+            {
+                _startingEnteredAt = DateTime.MinValue;
+            }
+        }
+
+        private void HandleCyclingCountdown(DateTime now, ref bool performedPoll)
+        {
+            bool shouldTick;
+            lock (_stateLock)
+            {
+                if (_cyclingLastTick == DateTime.MinValue)
+                {
+                    _cyclingLastTick = now;
+                    return;
+                }
+
+                shouldTick = now - _cyclingLastTick >= TimeSpan.FromSeconds(5);
+                if (shouldTick)
+                {
+                    _cyclingLastTick = now;
+                }
+            }
+
+            if (!shouldTick) return;
+
+            ushort remaining;
+            var remainingItem = GetRegisterByAddress(RegRemainingTime);
+            if (remainingItem?.LastValue is int lastValue)
+            {
+                remaining = (ushort)lastValue;
+            }
+            else
+            {
+                try
+                {
+                    remaining = ReadUInt16(RegRemainingTime);
+                    performedPoll = true;
+                    if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, remaining));
+                }
+                catch (Exception ex)
+                {
+                    AppendActivity($"Cycling decrement failed: {ex.Message}");
+                    return;
+                }
+            }
+
+            if (remaining == 0) return;
+
+            ushort next = (ushort)(remaining - 1);
+            try
+            {
+                _modbusClient!.WriteSingleRegister(RegRemainingTime, next);
+                if (remainingItem != null) Ui(() => UpdateRegisterValueDisplay(remainingItem, next));
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Cycling decrement failed: {ex.Message}");
+                return;
+            }
+
+            if (next == 0)
+            {
+                try
+                {
+                    _modbusClient!.WriteSingleRegister(RegEventTracker, 60);
+                    var evtItem = GetRegisterByAddress(RegEventTracker);
+                    if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 60));
+                    AppendActivity("Cycle finished → Cycle Finished");
+                    lock (_stateLock)
+                    {
+                        _cycleFinishedEnteredAt = DateTime.UtcNow;
+                        _automationLastProcessedEvent = null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppendActivity($"Failed to advance to Cycle Finished: {ex.Message}");
+                }
+            }
+        }
+
+        private void HandleCycleFinishedReturn(DateTime now, DateTime enteredAt)
+        {
+            if (enteredAt == DateTime.MinValue) return;
+            if (now - enteredAt < TimeSpan.FromSeconds(10)) return;
+
+            try
+            {
+                _modbusClient!.WriteSingleRegister(RegEventTracker, 10);
+                var evtItem = GetRegisterByAddress(RegEventTracker);
+                if (evtItem != null) Ui(() => UpdateRegisterValueDisplay(evtItem, 10));
+                AppendActivity("Cycle finished timeout → Idle");
+                ResetRunRegistersToZero();
+            }
+            catch (Exception ex)
+            {
+                AppendActivity($"Failed to return to Idle: {ex.Message}");
+                return;
+            }
+
+            lock (_stateLock)
+            {
+                _cycleFinishedEnteredAt = DateTime.MinValue;
+            }
+        }
+
+        private void OnEventTrackerValueObserved(int value)
+        {
+            lock (_stateLock)
+            {
+                int? previous = _lastEventTrackerValue;
+                _lastEventTrackerValue = value;
+                if (previous == value) return;
+
+                _automationLastProcessedEvent = null;
+                _lastPollByEvent[value] = DateTime.MinValue;
+
+                if (value != 40) _startingEnteredAt = DateTime.MinValue;
+                if (value != 50) _cyclingLastTick = DateTime.MinValue;
+                if (value != 60) _cycleFinishedEnteredAt = DateTime.MinValue;
             }
         }
 
@@ -552,9 +1188,60 @@ namespace ModbusSimV1
         {
             if (_suppressEventCombo) return; if (cmbEvent.SelectedItem is not string name) return;
             if (_eventMapByName == null || !_eventMapByName.TryGetValue(name, out int value)) return;
-            try { if (_modbusClient is { Connected: true }) { _modbusClient.WriteSingleRegister(0x0001, (ushort)value); AppendActivity($"Machine Event → {name} ({value})"); } }
+            try { if (_modbusClient is { Connected: true }) { _modbusClient.WriteSingleRegister(RegEventTracker, (ushort)value); AppendActivity($"Machine Event → {name} ({value})"); } }
             catch (Exception ex) { AppendActivity($"Machine Event write error: {ex.Message}"); }
-            var evtItem = _registerItems.FirstOrDefault(r => r.Address == 0x0001); if (evtItem != null) UpdateRegisterValueDisplay(evtItem, value);
+            var evtItem = _registerItems.FirstOrDefault(r => r.Address == RegEventTracker); if (evtItem != null) UpdateRegisterValueDisplay(evtItem, value);
+        }
+
+        private void CmbMachineEvent_SelectedIndexChanged(object? sender, EventArgs e) => CmbEvent_SelectedIndexChanged(sender, e);
+
+        private void chkAutomationEnabled_CheckedChanged(object? sender, EventArgs e)
+        {
+            bool enabled = chkAutomationEnabled.Checked;
+            AppendActivity(enabled ? "Automation enabled." : "Automation disabled.");
+            lock (_stateLock)
+            {
+                _automationLastProcessedEvent = null;
+                _lastPollByEvent.Clear();
+                if (!enabled)
+                {
+                    _startingEnteredAt = DateTime.MinValue;
+                    _cyclingLastTick = DateTime.MinValue;
+                    _cycleFinishedEnteredAt = DateTime.MinValue;
+                }
+            }
+
+            if (enabled)
+            {
+                PrimeEventTrackerFromSlave();
+            }
+        }
+
+        private void headerPanel_Paint(object? sender, PaintEventArgs e)
+        {
+            using var pen = new Pen(Color.FromArgb(64, Color.Black));
+            e.Graphics.DrawLine(pen, 0, e.ClipRectangle.Bottom - 1, e.ClipRectangle.Right, e.ClipRectangle.Bottom - 1);
+        }
+
+        private void flowRegisters_Paint(object? sender, PaintEventArgs e)
+        {
+            // No custom painting required; method exists to satisfy designer hook.
+        }
+
+        private void label1_Click(object? sender, EventArgs e)
+        {
+            // Intentionally left empty; label is informational only.
+        }
+
+        private void lstActivity_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            // Keep the activity log read-only by clearing the selection.
+            if (lstActivity.SelectedIndex >= 0) lstActivity.ClearSelected();
+        }
+
+        private void lstRxTx_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            if (lstRxTx.SelectedIndex >= 0) lstRxTx.ClearSelected();
         }
 
         // ===== misc UI =====
@@ -570,6 +1257,81 @@ namespace ModbusSimV1
                 while (lstActivity.Items.Count > 300) lstActivity.Items.RemoveAt(lstActivity.Items.Count - 1);
             }
             if (InvokeRequired) BeginInvoke((Action)DoAppend); else DoAppend();
+        }
+
+        private void AppendRxTx(bool isTransmit, byte[] data)
+        {
+            if (data.Length == 0) return;
+            var hex = BitConverter.ToString(data).Replace("-", " ");
+            int sequence = Interlocked.Increment(ref _rxTxSequence);
+            string direction = isTransmit ? "Tx" : "Rx";
+            string line = $"{sequence:D6}-> {direction}::{hex}";
+
+            void DoAppend()
+            {
+                lstRxTx.Items.Insert(0, line);
+                while (lstRxTx.Items.Count > RxTxLogCapacity)
+                {
+                    lstRxTx.Items.RemoveAt(lstRxTx.Items.Count - 1);
+                }
+            }
+
+            if (InvokeRequired) BeginInvoke((Action)DoAppend); else DoAppend();
+        }
+
+        private void ResetRxTxLog()
+        {
+            _rxTxSequence = 0;
+            void DoReset() => lstRxTx.Items.Clear();
+            if (InvokeRequired) BeginInvoke((Action)DoReset); else DoReset();
+        }
+
+        private void AttachClientEvents(ModbusClient client)
+        {
+            client.SendDataChanged += OnModbusSendDataChanged;
+            client.ReceiveDataChanged += OnModbusReceiveDataChanged;
+        }
+
+        private void DetachClientEvents(ModbusClient client)
+        {
+            client.SendDataChanged -= OnModbusSendDataChanged;
+            client.ReceiveDataChanged -= OnModbusReceiveDataChanged;
+        }
+
+        private void OnModbusSendDataChanged(object sender)
+        {
+            if (sender is not ModbusClient client) return;
+            var buffer = GetClientBuffer(client, SendDataProperty, SendDataField);
+            if (buffer != null && buffer.Length > 0) AppendRxTx(true, buffer);
+        }
+
+        private void OnModbusReceiveDataChanged(object sender)
+        {
+            if (sender is not ModbusClient client) return;
+            var buffer = GetClientBuffer(client, ReceiveDataProperty, ReceiveDataField);
+            if (buffer != null && buffer.Length > 0) AppendRxTx(false, buffer);
+        }
+
+        private static byte[]? GetClientBuffer(ModbusClient client, PropertyInfo? property, FieldInfo? field)
+        {
+            if (property != null && property.GetValue(client) is byte[] propData && propData.Length > 0)
+            {
+                var copy = new byte[propData.Length];
+                Buffer.BlockCopy(propData, 0, copy, 0, propData.Length);
+                return copy;
+            }
+
+            if (field != null && field.GetValue(client) is byte[] fieldData && fieldData.Length > 0)
+            {
+                int length = fieldData.Length;
+                while (length > 0 && fieldData[length - 1] == 0) length--;
+                if (length <= 0) return null;
+                var copy = new byte[length];
+                Buffer.BlockCopy(fieldData, 0, copy, 0, length);
+                return copy;
+            }
+
+            return null;
         }
 
         // ===== inner types =====
